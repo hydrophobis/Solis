@@ -1,0 +1,19 @@
+--- indexing is by character, not byte ---
+len     = 24
+at(2)   = ï
+sub     = Grüße
+index   = 18
+reverse = evïan
+chars   = [G, r, ü, ß, e]
+split   = [naïve, Grüße, ΣΟΦΙΑ, Привет]
+--- case mapping ---
+upper   = NAÏVE GRÜSSE ΣΟΦΙΑ ПРИВЕТ
+lower   = naïve grüße σοφια привет
+sharp s = STRASSE
+sigma   = οδος σοφια σ
+latin   = ŁÓDŹ ČŠŽ / łódź čšž
+cyril   = ЁЛКА МИР / ёлка мир
+nordic  = Æ Ø Å Þ Ð Ÿ / æ ø å þ ð ÿ
+--- round trip ---
+stable  = true
+idem    = true

@@ -1,0 +1,171 @@
+(* ==========================================================================
+   Solis grammar - working draft 2 (C-family revision)
+
+   Changes from draft 1: `func` not `fn`; `interface` not `trait`; methods live
+   inside the type body instead of a separate `impl`; `this` not `self`;
+   `: T` return types instead of `-> T`; `switch`/`case` instead of
+   `match`/`=>`; nulls instead of optionals. Generics stay on `[T]`.
+
+   Notation: EBNF. {x} zero or more, [x] optional, | alternation.
+
+   Deliberate properties:
+     - statement-terminating semicolons required (no ASI class of bug)
+     - every block braced (no dangling-else)
+     - declarations keyword-led, so the parser never backtracks to tell a
+       declaration from an expression
+   ========================================================================== *)
+
+program        = { item } ;
+
+item           = func_decl
+               | struct_decl
+               | enum_decl
+               | interface_decl
+               | extern_decl
+               | let_stmt ;
+
+(* --- declarations ------------------------------------------------------- *)
+
+func_decl      = [ 'static' ] [ 'mut' ] 'func' ident [ generics ]
+                 '(' [ param_list ] ')' [ ':' type ] block ;
+
+generics       = '[' generic_param { ',' generic_param } ']' ;
+generic_param  = ident [ ':' path { '+' path } ] ;
+
+param_list     = param { ',' param } [ ',' ] ;
+param          = ident ':' type ;
+
+struct_decl    = 'struct' ident [ generics ] [ ':' iface_list ] '{' { member } '}' ;
+iface_list     = path { ',' path } ;
+
+member         = field | func_decl ;
+field          = [ 'weak' ] ident ':' type ';' ;
+
+enum_decl      = 'enum' ident [ generics ] '{' [ variant_list ] '}' ;
+variant_list   = variant { ',' variant } [ ',' ] ;
+variant        = ident [ '(' param_list ')' ] ;   (* payload fields are named *)
+
+interface_decl = 'interface' ident [ generics ] '{' { iface_item } '}' ;
+iface_item     = [ 'mut' ] 'func' ident '(' [ param_list ] ')' [ ':' type ]
+                 ( block | ';' ) ;                (* block = default impl    *)
+
+extern_decl    = 'extern' 'func' ident '(' [ param_list ] ')' [ ':' type ] ';' ;
+
+(* --- types -------------------------------------------------------------- *)
+
+type           = [ 'weak' ] base_type ;
+base_type      = path [ '[' type { ',' type } ']' ]
+               | '[' type ']'                      (* array                 *)
+               | '{' type ':' type '}'             (* map                   *)
+               | '(' [ type { ',' type } ] ')'     (* tuple / unit          *)
+               | 'func' '(' [ type { ',' type } ] ')' [ ':' type ] ;
+
+path           = ident { '.' ident } ;
+
+(* --- statements --------------------------------------------------------- *)
+
+block          = '{' { stmt } '}' ;
+
+stmt           = let_stmt
+               | var_stmt
+               | assign_stmt
+               | if_stmt
+               | while_stmt
+               | for_stmt
+               | switch_stmt
+               | arena_stmt
+               | return_stmt
+               | 'break' ';'
+               | 'continue' ';'
+               | block
+               | expr ';' ;
+
+let_stmt       = 'let' ident [ ':' type ] '=' expr ';' ;
+var_stmt       = 'var' ident [ ':' type ] '=' expr ';' ;
+assign_stmt    = place assign_op expr ';' ;
+assign_op      = '=' | '+=' | '-=' | '*=' | '/=' | '%=' ;
+place          = ( ident | 'this' ) { '.' ident | '[' expr ']' } ;
+
+if_stmt        = 'if' expr block [ 'else' ( if_stmt | block ) ] ;
+while_stmt     = 'while' expr block ;
+for_stmt       = 'for' ident 'in' expr block ;
+arena_stmt     = 'arena' block ;
+return_stmt    = 'return' [ expr ] ';' ;
+
+(* Cases do not fall through; each runs to the next `case` or the closing
+   brace. Switching on an enum must cover every variant, or name the ones
+   missed. `default` is only permitted on non-enum switches. *)
+switch_stmt    = 'switch' expr '{' { case_clause } [ default_clause ] '}' ;
+case_clause    = 'case' pattern { ',' pattern } ':' { stmt } ;
+default_clause = 'default' ':' { stmt } ;
+
+(* --- patterns ----------------------------------------------------------- *)
+
+pattern        = '_'
+               | literal
+               | path [ '(' binding { ',' binding } ')' ] ;
+binding        = ident ;                           (* binds the named field *)
+
+(* --- expressions, loosest to tightest binding --------------------------- *)
+
+expr           = or_expr ;
+or_expr        = and_expr   { '||' and_expr } ;
+and_expr       = eq_expr    { '&&' eq_expr } ;
+eq_expr        = cmp_expr   { ( '==' | '!=' ) cmp_expr } ;
+cmp_expr       = add_expr   { ( '<' | '<=' | '>' | '>=' ) add_expr } ;
+add_expr       = mul_expr   { ( '+' | '-' ) mul_expr } ;
+mul_expr       = unary_expr { ( '*' | '/' | '%' ) unary_expr } ;
+unary_expr     = ( '!' | '-' ) unary_expr
+               | postfix_expr ;
+
+postfix_expr   = primary { '.' ident
+                         | '?' '.' ident           (* null-short-circuiting *)
+                         | '(' [ args ] ')'
+                         | '[' expr ']' } ;
+args           = expr { ',' expr } [ ',' ] ;
+
+primary        = literal
+               | 'this'
+               | path
+               | struct_lit
+               | array_lit
+               | map_lit
+               | '(' expr ')' ;
+
+struct_lit     = path '{' [ field_init { ',' field_init } [ ',' ] ] '}' ;
+field_init     = ident ':' expr | ident ;          (* shorthand punning     *)
+array_lit      = '[' [ expr { ',' expr } [ ',' ] ] ']' ;
+map_lit        = '{' [ expr ':' expr { ',' expr ':' expr } [ ',' ] ] '}' ;
+
+(* --- lexical ------------------------------------------------------------ *)
+
+literal        = int_lit | float_lit | str_lit | 'true' | 'false' | 'null' ;
+
+int_lit        = digit { digit | '_' }
+               | '0x' hex { hex | '_' }
+               | '0b' ( '0' | '1' ) { '0' | '1' | '_' } ;
+float_lit      = digit { digit | '_' } '.' digit { digit | '_' }
+                 [ ( 'e' | 'E' ) [ '+' | '-' ] digit { digit } ] ;
+
+str_lit        = '"' { str_char | interpolation } '"' ;
+interpolation  = '${' expr '}' ;
+str_char       = ? any char except '"', '\' or '$' ? | escape ;
+escape         = '\' ( 'n' | 't' | 'r' | '0' | '\' | '"' | '$' ) ;
+
+ident          = ( letter | '_' ) { letter | digit | '_' } ;
+
+comment        = '//' { ? not newline ? }
+               | '/*' { ? any ? | comment } '*/' ;   (* block comments nest *)
+
+(* Reserved words - may not be used as identifiers.
+
+   func let var if else while for in switch case default return break continue
+   struct enum interface static extern arena weak mut this
+   true false null
+
+   Generics use `[T]`, not `<T>`. Brackets stay unambiguous in every position:
+   after a function name a `[` can only be generics; in type position a leading
+   `[` is an array while `path[...]` is an instantiation; in expression position
+   `a[b]` is always indexing. No turbofish is needed, which `<T>` would have
+   required for the same reason C++, Java and TypeScript all struggle with it.
+*)

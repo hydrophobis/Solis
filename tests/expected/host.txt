@@ -1,0 +1,6 @@
+running on: HOST
+----------------------------
+busy() = 599994
+took N ms
+============================
+the host exposed 3 functions; that is the entire sandbox

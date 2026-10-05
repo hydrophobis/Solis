@@ -1,0 +1,7 @@
+|v| = 5.0
+after scale, |v| = 10.0
+area = 3.14159
+area = 6.0
+sum  = 27
+max  = 9
+mean = 5

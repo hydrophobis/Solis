@@ -1,0 +1,14 @@
+# Keep line endings LF everywhere.
+#
+# This matters more than usual here. The stdlib's .sl source is embedded into
+# the compiler byte for byte via #embed, while std_fallback.h is generated with \n
+# escapes - so a CRLF checkout would feed the two paths different bytes. The
+# whole build is also checked by comparing bytecode byte for byte across
+# toolchains, which a platform-dependent checkout would undermine.
+* text=auto eol=lf
+
+# Bytecode is binary; never let eol normalisation near it.
+*.slb binary
+
+# Generated; collapse it in diffs.
+compiler/std_fallback.h linguist-generated=true

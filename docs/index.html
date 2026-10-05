@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solis — a small, embeddable scripting language</title>
+<meta name="description" content="Solis: a small, statically typed scripting language for embedding. No GC pauses, exhaustive switch, a sandboxed host boundary, and a 13.5 KB C runtime. Try it in your browser.">
+<link rel="icon" href="icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <a class="brand" href="index.html">
+    <img src="icon.png" alt="" width="22" height="22">
+    Solis
+  </a>
+  <nav class="site">
+    <a href="index.html" class="active">Home</a>
+    <a href="learn.html">Learn</a>
+    <a href="playground.html">Playground</a>
+    <a href="https://github.com/hydrophobis/Solis">GitHub</a>
+  </nav>
+</header>
+
+<main>
+  <h1>A small, statically typed language for embedding.</h1>
+  <p class="lede">
+    C-family syntax, structs as values, exhaustive <code>switch</code>, and a
+    host boundary a script can't see past. No garbage-collector pauses, no
+    install step, no cargo cult — one C99 binary, one virtual machine, and a
+    <code>.sl</code> file.
+  </p>
+
+  <div class="cta-row">
+    <a class="btn btn-primary" href="playground.html">Try it in your browser →</a>
+    <a class="btn btn-ghost" href="learn.html">Learn the language</a>
+  </div>
+
+  <div class="example" data-editable>
+    <div class="example-head">
+      <span>try it right here — edit it if you like</span>
+      <button class="run-btn">▶ Run</button>
+    </div>
+    <textarea class="code-edit" rows="21" spellcheck="false">struct Vec2 {
+    x: float;
+    y: float;
+
+    func length(): float {
+        return sqrt(this.x * this.x + this.y * this.y);
+    }
+
+    mut func scale(k: float) {
+        this.x *= k;
+        this.y *= k;
+    }
+}
+
+enum Shape {
+    Circle(r: float),
+    Rect(w: float, h: float),
+}
+
+func area(s: Shape): float {
+    switch s {
+        case Shape.Circle(r):  return 3.14159 * r * r;
+        case Shape.Rect(w, h): return w * h;
+    }
+}
+
+func main() {
+    var v = Vec2 { x: 3.0, y: 4.0 };
+    print("length = ${v.length()}");
+    v.scale(2.0);
+    print("after scale = ${v.length()}");
+
+    for s in [Shape.Circle(2.0), Shape.Rect(3.0, 4.0)] {
+        print("area = ${area(s)}");
+    }
+}</textarea>
+    <div class="output"></div>
+  </div>
+
+  <h2>Why not just use Lua?</h2>
+  <p>
+    Lua owns the embedded-scripting niche, and deservedly — a few hundred KB,
+    no dependencies, an API whose stack discipline makes ownership bugs
+    nearly impossible. Solis isn't trying to out-Lua Lua on size. It bets on
+    four things Lua is genuinely weak at:
+  </p>
+
+  <div class="features">
+    <div class="feature">
+      <h3>Sandboxing by construction</h3>
+      <p>A script reaches exactly the functions the host registered — nothing
+      else. No ambient filesystem, network, or clock.</p>
+    </div>
+    <div class="feature">
+      <h3>No GC pauses</h3>
+      <p>Reference counting with compile-time elision, not a tracing
+      collector. Deterministic memory for realtime loops.</p>
+    </div>
+    <div class="feature">
+      <h3>Rust/Elm-grade diagnostics</h3>
+      <p>A missed <code>switch</code> case is a compile error naming the
+      variant you forgot, not a runtime surprise.</p>
+    </div>
+    <div class="feature">
+      <h3>It's just C</h3>
+      <p>The whole toolchain is one C99 binary. An embedding host links a
+      library with no Rust, no cargo, no second toolchain.</p>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><b>13.5 KB</b><span>VM machine code</span></div>
+    <div class="stat"><b>256</b><span>frame call-depth limit</span></div>
+    <div class="stat"><b>11×</b><span>bytecode VM vs. tree-walker</span></div>
+    <div class="stat"><b>0</b><span>runtime dependencies</span></div>
+  </div>
+
+  <p class="note">
+    <b>What you just ran</b> compiled in your browser via WebAssembly and
+    executed on the real C bytecode VM — the same one a native build runs.
+    Nothing was sent to a server.
+  </p>
+</main>
+
+<footer class="site">
+  <span>Solis — a sun's worth of scripting language.</span>
+  <span><a href="https://github.com/hydrophobis/Solis">Source on GitHub</a></span>
+</footer>
+
+<script type="module">
+  import { wireExamples } from "./site.js";
+  wireExamples();
+</script>
+</body>
+</html>

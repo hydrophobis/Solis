@@ -1,0 +1,100 @@
+[meta]
+name = "Solis"
+version = "0.1.0"
+system = "c"
+
+[variables]
+cc = "gcc"
+cflags = "-std=c23 -O2 -Wall -Wextra"
+exe = { on = "platform", windows = ".exe", default = "" }
+
+compiler_headers = { in = "compiler", ending = [".h"] }
+runtime_headers = { in = "runtime", ending = [".h"] }
+std_sources = { in = "std", ending = [".sl"] }
+compiler_sources = { in = "compiler", ending = [".c"] }
+runtime_sources = { in = "runtime", ending = [".c"] }
+
+[profiles.debug]
+cflags = "-std=c23 -O0 -g -Wall -Wextra"
+
+[profiles.release]
+cflags = "-std=c23 -O2 -DNDEBUG -Wall -Wextra"
+
+[profiles.strict]
+cflags = "-std=c23 -O2 -Wall -Wextra -pedantic -Werror"
+
+[tasks.solis]
+command = "{cc}"
+flags = "{cflags} -Icompiler -Iruntime"
+files = "{compiler_sources} {runtime_sources} cli/solis.c"
+headers = "{compiler_headers} {runtime_headers} {std_sources}"
+output = "-o solis{exe} -lm"
+outputs = ["solis{exe}"]
+
+[tasks.lib]
+default = false
+command = "{cc}"
+flags = "{cflags} -c"
+files = ["runtime/solis.c", "runtime/solis_std.c"]
+headers = "{runtime_headers}"
+outputs = ["solis.o", "solis_std.o"]
+
+[tasks.archive]
+depends = ["lib"]
+default = false
+command = "ar"
+flags = "rcs runtime/libsolis.a"
+files = "{task.lib.outputs}"
+outputs = ["runtime/libsolis.a"]
+
+[tasks.amalgamate]
+default = false
+command = "python tools/amalgamate.py"
+files = ["runtime/solis.c", "runtime/solis_std.c"]
+headers = "{runtime_headers}"
+outputs = ["build/runtime.c"]
+
+[tasks.cpp]
+default = false
+command = "g++"
+flags = "-std=c++17 -O2 -Wall -Wextra -Iruntime"
+files = ["runtime/example.cpp", "runtime/solis.c", "runtime/solis_std.c"]
+headers = { in = "runtime", ending = [".h", ".hpp"] }
+output = "-o runtime/solis-run++{exe} -lm"
+outputs = ["runtime/solis-run++{exe}"]
+
+[tasks.std]
+default = false
+always_run = true
+command = "python compiler/embed_std.py"
+
+[tasks.fallback]
+depends = ["solis"]
+always_run = true
+command = "bash tools/check-fallback.sh"
+
+[tasks.bless]
+default = false
+always_run = true
+command = "bash tools/bless.sh --yes"
+
+[tasks.conform]
+depends = ["solis", "fallback"]
+always_run = true
+command = "bash tools/conform.sh"
+
+[tasks.batteries]
+depends = ["solis"]
+always_run = true
+command = "bash tools/batteries.sh"
+
+[tasks.grammar]
+default = false
+always_run = true
+command = "npm --prefix editors/vscode-solis test"
+
+[tasks.clean]
+default = false
+always_run = true
+command = { on = "platform", windows = "cmd /c del /q", default = "rm -f" }
+flags = { on = "platform", windows = "solis.exe runtime\\libsolis.a 2>nul & exit /b 0", default = "solis runtime/libsolis.a" }

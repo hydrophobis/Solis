@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Learn Solis</title>
+<meta name="description" content="A short, runnable tour of Solis: variables, functions, structs, enums, modules, and the host boundary.">
+<link rel="icon" href="icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <a class="brand" href="index.html">
+    <img src="icon.png" alt="" width="22" height="22">
+    Solis
+  </a>
+  <nav class="site">
+    <a href="index.html">Home</a>
+    <a href="learn.html" class="active">Learn</a>
+    <a href="playground.html">Playground</a>
+    <a href="https://github.com/hydrophobis/Solis">GitHub</a>
+  </nav>
+</header>
+
+<main>
+  <h1>Learn Solis</h1>
+  <p class="lede">
+    Every block below is live — click <b>Run</b> and it actually compiles and
+    executes, right in this tab. Edit anything you like before running it.
+  </p>
+
+<div class="learn-layout">
+  <nav class="learn-nav">
+    <a href="#hello">Hello, world</a>
+    <a href="#variables">Variables &amp; types</a>
+    <a href="#functions">Functions</a>
+    <a href="#control-flow">Control flow</a>
+    <a href="#arrays">Arrays</a>
+    <a href="#structs">Structs &amp; methods</a>
+    <a href="#enums">Enums &amp; switch</a>
+    <a href="#null">Null</a>
+    <a href="#modules">Modules &amp; stdlib</a>
+    <a href="#host">Talking to the host</a>
+    <a href="#status">What's solid</a>
+  </nav>
+
+  <div class="learn-content">
+
+    <h2 id="hello">Hello, world</h2>
+    <p>
+      <code>print</code> is a built-in — no import, no declaration. Strings
+      interpolate with <code>${...}</code>, and every statement ends with a
+      semicolon: no automatic insertion means no ASI bugs to debug.
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>hello.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="5" spellcheck="false">func main() {
+    print("Hello, Solis!");
+    let name = "world";
+    print("hello, ${name}");
+}</textarea>
+      <div class="output"></div>
+    </div>
+
+    <h2 id="variables">Variables &amp; types</h2>
+    <p>
+      <code>let</code> is immutable, <code>var</code> opts into mutation.
+      Types are inferred inside a function body and always written at
+      boundaries — here that's just the annotations on <code>pi</code> and
+      <code>ready</code>, to show the syntax; <code>lives</code> and
+      <code>title</code> infer fine without one.
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>variables.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="10" spellcheck="false">func main() {
+    let pi: float = 3.14159;
+    var lives = 3;
+    let title = "Solis";
+    let ready: bool = true;
+
+    lives -= 1;
+    print("pi = ${pi}");
+    print("lives = ${lives}");
+    print("${title} ready: ${ready}");
+}</textarea>
+      <div class="output"></div>
+    </div>
+
+    <h2 id="functions">Functions</h2>
+    <p>
+      <code>func name(params): ReturnType</code>. Recursion is unremarkable —
+      Solis caps call depth at 256 frames, the same limit enforced the same
+      way whether the script is interpreted or compiled ahead of time.
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>functions.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="12" spellcheck="false">func fib(n: int): int {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+func main() {
+    var i = 0;
+    while i < 8 {
+        print("fib(${i}) = ${fib(i)}");
+        i += 1;
+    }
+}</textarea>
+      <div class="output"></div>
+    </div>
+
+    <h2 id="control-flow">Control flow</h2>
+    <p>
+      Every block is braced — no dangling-else — and <code>for x in xs</code>
+      walks an array directly, with no iterator protocol underneath it.
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>control-flow.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="10" spellcheck="false">func main() {
+    let nums = [10, 20, 30, 40];
+    for n in nums {
+        if n >= 30 {
+            print("big: ${n}");
+        } else {
+            print("small: ${n}");
+        }
+    }
+}</textarea>
+      <div class="output"></div>
+    </div>
+
+    <h2 id="arrays">Arrays</h2>
+    <p>
+      <code>len</code> and <code>push</code> are built-ins too, typed loosely
+      so they work on an array of anything — the one place the standard
+      library is weaker than it looks, and an honest trade for not having
+      generics on every function.
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>arrays.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="13" spellcheck="false">func sum(xs: [int]): int {
+    var total = 0;
+    for x in xs {
+        total += x;
+    }
+    return total;
+}
+
+func main() {
+    var nums = [1, 2, 3];
+    push(nums, 4);
+    print("len = ${len(nums)}");
+    print("sum = ${sum(nums)}");
+}</textarea>
+      <div class="output"></div>
+    </div>
+
+    <h2 id="structs">Structs &amp; methods</h2>
+    <p>
+      Structs are values — inline layout, no allocation, no refcount traffic.
+      Fields and methods share one body, C++/TypeScript-style.
+      <code>this</code> needs no receiver parameter, <code>mut func</code>
+      marks a method that writes to it (leave it off and that write is a
+      compile error, not a silent copy), and <code>static func</code> is for
+      methods that need no instance at all.
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>structs.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="21" spellcheck="false">struct Vec2 {
+    x: float;
+    y: float;
+
+    func length(): float {
+        return sqrt(this.x * this.x + this.y * this.y);
+    }
+
+    mut func scale(k: float) {
+        this.x *= k;
+        this.y *= k;
+    }
+
+    static func zero(): Vec2 {
+        return Vec2 { x: 0.0, y: 0.0 };
+    }
+}
+
+func main() {
+    var v = Vec2 { x: 3.0, y: 4.0 };
+    print("length = ${v.length()}");
+    v.scale(2.0);
+    print("after scale = ${v.length()}");
+    let origin = Vec2.zero();
+    print("origin = ${origin.x}, ${origin.y}");
+}</textarea>
+      <div class="output"></div>
+    </div>
+
+    <h2 id="enums">Enums &amp; switch</h2>
+    <p>
+      Enums are real tagged unions — variants can carry named payload
+      fields. <code>switch</code> is exhaustive: comment out a case below and
+      re-run it to see the compiler name the variant you left out, rather
+      than finding out at runtime.
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>enums.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="19" spellcheck="false">enum Shape {
+    Circle(r: float),
+    Rect(w: float, h: float),
+    Point,
+}
+
+func area(s: Shape): float {
+    switch s {
+        case Shape.Circle(r):
+            return 3.14159 * r * r;
+        case Shape.Rect(w, h):
+            return w * h;
+        case Shape.Point:
+            return 0.0;
+    }
+}
+
+func main() {
+    let shapes = [Shape.Circle(2.0), Shape.Rect(3.0, 4.0), Shape.Point];
+    for s in shapes {
+        print("area = ${area(s)}");
+    }
+}</textarea>
+      <div class="output"></div>
+    </div>
+
+    <h2 id="null">Null</h2>
+    <p>
+      Reference types may be <code>null</code>. There's no <code>?.</code>
+      short-circuit yet, but a plain comparison against <code>null</code>
+      works, which is enough to guard a lookup that might not find anything.
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>null.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="14" spellcheck="false">struct Player {
+    name: str;
+}
+
+func findPlayer(id: int): Player {
+    if id < 0 {
+        return null;
+    }
+    return Player { name: "hero" };
+}
+
+func main() {
+    let p = findPlayer(-1);
+    if p != null {
+        print("hello, ${p.name}");
+    } else {
+        print("no such player");
+    }
+}</textarea>
+      <div class="output"></div>
+    </div>
+
+    <h2 id="modules">Modules &amp; stdlib</h2>
+    <p>
+      <code>math</code> and <code>strings</code> are part of the language
+      itself — compiled into the runtime, so <code>import math;</code> needs
+      no file on disk. Everything a module declares is reachable as
+      <code>module.name</code>.
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>modules.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="8" spellcheck="false">import math;
+import strings;
+
+func main() {
+    print("sqrt(2) = ${math.sqrt(2.0)}");
+    print("max = ${math.max(3, 7)}");
+    print("upper = ${strings.upper("solis")}");
+    print("reversed = ${strings.reverse("abc")}");
+}</textarea>
+      <div class="output"></div>
+    </div>
+
+    <h2 id="host">Talking to the host</h2>
+    <p>
+      <code>extern func</code> declares a function the host provides.
+      That's the entire sandbox: a script reaches exactly what's registered
+      and nothing else — no ambient filesystem, no network, no clock, unless
+      the embedder hands one over. This playground registers
+      <code>hostName</code> and <code>roll</code> just so this example has
+      something to call.
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>host.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="6" spellcheck="false">extern func hostName(): str;
+extern func roll(sides: int): int;
+
+func main() {
+    print("running on ${hostName()}");
+    print("rolled a ${roll(6)}");
+}</textarea>
+      <div class="output"></div>
+    </div>
+    <p>
+      In a real embedding, a <code>prelude.sl</code> file sitting beside the
+      scripts declares every extern once, so individual plugins don't repeat
+      the host's whole API just to call three functions from it.
+    </p>
+
+    <h2 id="status">What's solid, what's in progress</h2>
+    <p>
+      Solis is a work in progress, and the honest version of that table beats
+      a glossy one:
+    </p>
+    <table class="status">
+      <tr><th>Area</th><th>Status</th></tr>
+      <tr><td>Core language — functions, control flow, structs, enums, exhaustive switch, modules</td><td><span class="pill pill-ok">solid</span></td></tr>
+      <tr><td>Standard library — <code>math</code>, <code>strings</code>, and the batteries (<code>io</code>/<code>fs</code>/<code>os</code>/<code>time</code>/<code>rand</code>) in a native build</td><td><span class="pill pill-ok">solid</span></td></tr>
+      <tr><td>Host boundary — <code>extern func</code>, the prelude mechanism</td><td><span class="pill pill-ok">solid</span></td></tr>
+      <tr><td><code>null</code> and reference types</td><td><span class="pill pill-ok">solid</span></td></tr>
+      <tr><td>Generics, interfaces, <code>weak</code>, <code>arena</code> blocks</td><td><span class="pill pill-cut">removed</span></td></tr>
+    </table>
+    <p>
+      Generics, interfaces, <code>weak</code> and <code>arena</code> aren't
+      missing — they were cut from the language on purpose, to keep the
+      compiler small and every remaining hard problem (ARC elision, cycle
+      detection, monomorphising) off the table.
+    </p>
+    <p>
+      This page only runs examples from the solid row, on purpose — a
+      learning tour that occasionally breaks isn't a learning tour. See
+      <a href="https://github.com/hydrophobis/Solis/blob/master/docs/design.md">design.md</a>
+      in the repo for the full design log, including why each of those
+      decisions was made.
+    </p>
+
+  </div>
+</div>
+</main>
+
+<footer class="site">
+  <span>Solis — a sun's worth of scripting language.</span>
+  <span><a href="https://github.com/hydrophobis/Solis">Source on GitHub</a></span>
+</footer>
+
+<script type="module">
+  import { wireExamples } from "./site.js";
+  wireExamples();
+</script>
+</body>
+</html>

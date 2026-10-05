@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solis Playground</title>
+<meta name="description" content="Write and run Solis in your browser.">
+<link rel="icon" href="icon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site">
+  <a class="brand" href="index.html">
+    <img src="icon.png" alt="" width="22" height="22">
+    Solis
+  </a>
+  <nav class="site">
+    <a href="index.html">Home</a>
+    <a href="learn.html">Learn</a>
+    <a href="playground.html" class="active">Playground</a>
+    <a href="https://github.com/hydrophobis/Solis">GitHub</a>
+  </nav>
+</header>
+
+<main style="max-width: 1100px;">
+  <h1>Playground</h1>
+  <p class="lede">
+    Write Solis, run it, see what happens. <code>print</code>,
+    <code>hostName()</code>, <code>roll(sides)</code> and <code>nowMs()</code>
+    are registered for you, standing in for whatever a real embedder would
+    hand a script.
+  </p>
+
+  <div class="pg-shell">
+    <div class="pg-panel">
+      <div class="pg-panel-head">
+        <select class="pg-pick" id="pg-pick">
+          <option value="hello">Hello, world</option>
+          <option value="vec2">Vec2 struct</option>
+          <option value="shapes">Enums &amp; switch</option>
+          <option value="host">Host functions</option>
+          <option value="scratch">Blank</option>
+        </select>
+        <button class="run-btn" id="pg-run">▶ Run (Ctrl+Enter)</button>
+      </div>
+      <textarea id="pg-editor" spellcheck="false"></textarea>
+    </div>
+    <div class="pg-panel">
+      <div class="pg-panel-head"><span>Output</span></div>
+      <div id="pg-output"></div>
+    </div>
+  </div>
+
+  <p class="note">
+    Runs in-browser on a real C bytecode VM compiled to WebAssembly — nothing
+    you type here leaves your machine.
+  </p>
+</main>
+
+<footer class="site">
+  <span>Solis — a sun's worth of scripting language.</span>
+  <span><a href="https://github.com/hydrophobis/Solis">Source on GitHub</a></span>
+</footer>
+
+<script type="module">
+import { runSolis } from "./site.js";
+
+const SAMPLES = {
+  hello: `func main() {
+    print("Hello, Solis!");
+    let name = "world";
+    print("hello, \${name}");
+}`,
+  vec2: `struct Vec2 {
+    x: float;
+    y: float;
+
+    func length(): float {
+        return sqrt(this.x * this.x + this.y * this.y);
+    }
+
+    mut func scale(k: float) {
+        this.x *= k;
+        this.y *= k;
+    }
+
+    static func zero(): Vec2 {
+        return Vec2 { x: 0.0, y: 0.0 };
+    }
+}
+
+func main() {
+    var v = Vec2 { x: 3.0, y: 4.0 };
+    print("length = \${v.length()}");
+    v.scale(2.0);
+    print("after scale = \${v.length()}");
+}`,
+  shapes: `enum Shape {
+    Circle(r: float),
+    Rect(w: float, h: float),
+    Point,
+}
+
+func area(s: Shape): float {
+    switch s {
+        case Shape.Circle(r):
+            return 3.14159 * r * r;
+        case Shape.Rect(w, h):
+            return w * h;
+        case Shape.Point:
+            return 0.0;
+    }
+}
+
+func main() {
+    let shapes = [Shape.Circle(2.0), Shape.Rect(3.0, 4.0), Shape.Point];
+    for s in shapes {
+        print("area = \${area(s)}");
+    }
+}`,
+  host: `extern func hostName(): str;
+extern func roll(sides: int): int;
+extern func nowMs(): int;
+
+func main() {
+    print("running on \${hostName()}");
+    print("rolled a \${roll(6)}");
+    print("the clock is reachable: \${nowMs() >= 0}");
+}`,
+  scratch: `func main() {
+    print("hello from solis");
+}`,
+};
+
+const editor = document.getElementById("pg-editor");
+const output = document.getElementById("pg-output");
+const runBtn = document.getElementById("pg-run");
+const pick = document.getElementById("pg-pick");
+
+function load(key) {
+    editor.value = SAMPLES[key] ?? SAMPLES.scratch;
+}
+
+const saved = (() => { try { return localStorage.getItem("solis-pg-src"); } catch { return null; } })();
+if (saved) editor.value = saved;
+else load("hello");
+
+pick.addEventListener("change", () => load(pick.value));
+
+async function run() {
+    runBtn.disabled = true;
+    output.innerHTML = "running…";
+    try { localStorage.setItem("solis-pg-src", editor.value); } catch {}
+    const { ok, lines, error } = await runSolis(editor.value);
+    output.innerHTML = "";
+    for (const line of lines) {
+        const d = document.createElement("span");
+        d.className = "line";
+        d.textContent = line;
+        output.appendChild(d);
+    }
+    if (!ok) {
+        const d = document.createElement("div");
+        d.className = "err";
+        d.textContent = error;
+        output.appendChild(d);
+    }
+    runBtn.disabled = false;
+}
+
+runBtn.addEventListener("click", run);
+editor.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") run();
+});
+</script>
+</body>
+</html>

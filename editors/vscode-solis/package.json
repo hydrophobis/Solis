@@ -1,0 +1,43 @@
+{
+  "name": "solis-lang",
+  "displayName": "Solis",
+  "description": "Syntax highlighting for Solis",
+  "version": "0.1.1",
+  "publisher": "solis-lang",
+  "license": "MIT",
+  "icon": "./icon.png",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "solis",
+        "aliases": ["Solis"],
+        "extensions": [".sl"],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icon.png",
+          "dark": "./icon.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "solis",
+        "scopeName": "source.solis",
+        "path": "./syntaxes/solis.tmLanguage.json"
+      }
+    ]
+  },
+  "scripts": {
+    "test": "node test-grammar.js"
+  },
+  "devDependencies": {
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  }
+}

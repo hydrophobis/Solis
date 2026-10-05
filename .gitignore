@@ -1,0 +1,21 @@
+node_modules/
+build/
+
+# Bloomery
+.bloomery_cache.json
+.bloomery_store/
+
+# build output
+/solis
+*.exe
+*.a
+*.o
+.deps.d
+*.slb
+
+# ...but the golden bytecode is the regression floor, so it is tracked.
+!tests/golden/*.slb
+
+# web: build.sh's emcc output
+web/solis_core.mjs
+web/solis_core.wasm

@@ -1,0 +1,3 @@
+fib(24) = 46368
+primes below 20000 = 2262
+bodies = 200, checksum = true
