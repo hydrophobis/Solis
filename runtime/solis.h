@@ -79,7 +79,9 @@ const char *sl_error(const sl_vm *vm);
 void        sl_fail(sl_vm *vm, const char *msg);
 
 // Reference counting. Call sl_retain on anything you keep past a native.
-void        sl_retain(sl_value v);
+static inline void sl_retain(sl_value v) {
+    if (v.type == SL_OBJ && v.as.o) v.as.o->rc++;
+}
 void        sl_release(sl_vm *vm, sl_value v);
 
 // Strings. sl_str copies `n` bytes; the result is owned by the caller.

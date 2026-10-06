@@ -43,7 +43,9 @@ enum {
 
     OP_DUP2 = 140, OP_COPY,
 
-    OP_NULL = 142
+    OP_NULL = 142,
+
+    OP_INCR_I = 150, OP_MOVE = 151, OP_ADD_RR_I = 152
 };
 
 typedef struct {
@@ -133,10 +135,6 @@ void sl_fail(sl_vm *vm, const char *msg) {
 }
 
 const char *sl_error(const sl_vm *vm) { return vm->err; }
-
-void sl_retain(sl_value v) {
-    if (v.type == SL_OBJ && v.as.o) v.as.o->rc++;
-}
 
 void sl_release(sl_vm *vm, sl_value v) {
     if (v.type != SL_OBJ || !v.as.o) return;
@@ -473,8 +471,8 @@ sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
     }
     r.p += 4;
     uint16_t version = rd_u16(&r);
-    if (version != 2) {
-        vm_error(vm, "bytecode version %u, this runtime understands 2", version);
+    if (version != 3) {
+        vm_error(vm, "bytecode version %u, this runtime understands 3", version);
         return SL_ERR_BADFILE;
     }
 
@@ -557,6 +555,7 @@ static uint16_t read_u16(uint8_t **ip) {
         *vm->sp++ = (v); \
     } while (0)
 #define POP() (*(--vm->sp))
+#define RELEASE(v) do { sl_value _v = (v); if (_v.type == SL_OBJ) sl_release(vm, _v); } while (0)
 
 sl_result sl_run(sl_vm *vm) {
     if (vm->nfuncs == 0) { vm_error(vm, "nothing loaded"); return SL_ERR_RUNTIME; }
@@ -600,7 +599,7 @@ sl_result sl_run(sl_vm *vm) {
 
         case OP_TRUE:  PUSH(sl_bool(true));  break;
         case OP_FALSE: PUSH(sl_bool(false)); break;
-        case OP_POP:   sl_release(vm, POP()); break;
+        case OP_POP:   RELEASE(POP()); break;
 
         case OP_DUP: { sl_value v = vm->sp[-1]; sl_retain(v); PUSH(v); break; }
 
@@ -609,7 +608,24 @@ sl_result sl_run(sl_vm *vm) {
             uint8_t s = *ip++;
             sl_value old = fr->slots[s];
             fr->slots[s] = POP();      // the stack's reference moves into the slot
-            sl_release(vm, old);
+            RELEASE(old);
+            break;
+        }
+
+        case OP_INCR_I: {
+            uint8_t s = *ip++;
+            int8_t imm = (int8_t)*ip++;
+            fr->slots[s].as.i += imm;
+            break;
+        }
+        case OP_MOVE: {
+            uint8_t dst = *ip++, src = *ip++;
+            fr->slots[dst] = fr->slots[src];
+            break;
+        }
+        case OP_ADD_RR_I: {
+            uint8_t dst = *ip++, s1 = *ip++, s2 = *ip++;
+            fr->slots[dst] = sl_int(fr->slots[s1].as.i + fr->slots[s2].as.i);
             break;
         }
 

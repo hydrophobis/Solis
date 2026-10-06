@@ -18,7 +18,7 @@ runtime_sources = { in = "runtime", ending = [".c"] }
 cflags = "-std=c23 -O0 -g -Wall -Wextra"
 
 [profiles.release]
-cflags = "-std=c23 -O2 -DNDEBUG -Wall -Wextra"
+cflags = "-std=c23 -O2 -DNDEBUG -Wall -Wextra -flto"
 
 [profiles.strict]
 cflags = "-std=c23 -O2 -Wall -Wextra -pedantic -Werror"

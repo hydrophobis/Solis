@@ -22,7 +22,7 @@
 #include "common.h"
 
 #define SL_MAGIC   "SLBC"
-#define SL_VERSION 2
+#define SL_VERSION 3
 
 typedef enum {
     // Push a small integer encoded in the instruction itself.
@@ -88,7 +88,11 @@ typedef enum {
     OP_COPY = 141,
 
     // Push a null reference: SL_OBJ with a NULL payload.
-    OP_NULL = 142
+    OP_NULL = 142,
+
+    OP_INCR_I = 150,   // u8 slot, i8 imm
+    OP_MOVE = 151,     // u8 dst, u8 src
+    OP_ADD_RR_I = 152  // u8 dst, u8 src1, u8 src2
 } opcode;
 
 typedef enum { C_INT, C_FLOAT, C_STR } const_kind;

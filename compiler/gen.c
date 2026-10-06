@@ -671,6 +671,25 @@ static void gen_assign(gen *G, stmt *s, emitter *e) {
         uint8_t slot;
         ty *t;
         if (resolve_local(G, n, &slot, &t)) {
+            if (op == ASSIGN_SET && value->kind == EX_PATH && value->as.p.n == 1 &&
+                (t->kind == TK_INT || t->kind == TK_FLOAT || t->kind == TK_BOOL)) {
+                uint8_t src; ty *st;
+                if (resolve_local(G, value->as.p.seg[0], &src, &st) && src != slot) {
+                    em_op(e, OP_MOVE);
+                    em_u8(e, slot); em_u8(e, src);
+                    return;
+                }
+            }
+            if ((op == ASSIGN_ADD || op == ASSIGN_SUB) && value->kind == EX_INT &&
+                t->kind == TK_INT) {
+                int64_t imm = op == ASSIGN_SUB ? -value->as.i : value->as.i;
+                if (imm >= -128 && imm <= 127) {
+                    em_op(e, OP_INCR_I);
+                    em_u8(e, slot);
+                    em_u8(e, (uint8_t)(int8_t)imm);
+                    return;
+                }
+            }
             if (op == ASSIGN_SET) {
                 ty *vt = gen_expr(G, value, e);
                 maybe_copy(G, vt, e);
@@ -874,7 +893,22 @@ static void gen_block(gen *G, block *b, emitter *e) {
 static void gen_stmt(gen *G, stmt *s, emitter *e) {
     switch (s->kind) {
         case ST_LET: {
-            ty *t = gen_expr(G, s->as.let_.value, e);
+            expr *val = s->as.let_.value;
+            if (val->kind == EX_BINARY && val->as.binary.op == OP_ADD) {
+                expr *lhs = val->as.binary.lhs, *rhs = val->as.binary.rhs;
+                uint8_t s1, s2; ty *t1, *t2;
+                if (lhs->kind == EX_PATH && lhs->as.p.n == 1 &&
+                    rhs->kind == EX_PATH && rhs->as.p.n == 1 &&
+                    resolve_local(G, lhs->as.p.seg[0], &s1, &t1) &&
+                    resolve_local(G, rhs->as.p.seg[0], &s2, &t2) &&
+                    t1->kind == TK_INT && t2->kind == TK_INT) {
+                    uint8_t slot = declare(G, s->as.let_.name, t1);
+                    em_op(e, OP_ADD_RR_I);
+                    em_u8(e, slot); em_u8(e, s1); em_u8(e, s2);
+                    return;
+                }
+            }
+            ty *t = gen_expr(G, val, e);
             maybe_copy(G, t, e);
             uint8_t slot = declare(G, s->as.let_.name, t);
             em_op(e, OP_STORE);
