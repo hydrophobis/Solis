@@ -118,10 +118,12 @@ mul_expr       = unary_expr { ( '*' | '/' | '%' ) unary_expr } ;
 unary_expr     = ( '!' | '-' ) unary_expr
                | postfix_expr ;
 
+(* A negative index counts from the end; still bounds-checked, never clamps. *)
 postfix_expr   = primary { '.' ident
                          | '?' '.' ident           (* null-short-circuiting *)
                          | '(' [ args ] ')'
-                         | '[' expr ']' } ;
+                         | '[' expr ']'
+                         | '[' [ expr ] ':' [ expr ] ']' } ;   (* slice *)
 args           = expr { ',' expr } [ ',' ] ;
 
 primary        = literal

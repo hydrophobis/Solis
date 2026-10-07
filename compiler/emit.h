@@ -22,7 +22,7 @@
 #include "common.h"
 
 #define SL_MAGIC   "SLBC"
-#define SL_VERSION 3
+#define SL_VERSION 5
 
 typedef enum {
     // Push a small integer encoded in the instruction itself.
@@ -92,7 +92,14 @@ typedef enum {
 
     OP_INCR_I = 150,   // u8 slot, i8 imm
     OP_MOVE = 151,     // u8 dst, u8 src
-    OP_ADD_RR_I = 152  // u8 dst, u8 src1, u8 src2
+    OP_ADD_RR_I = 152, // u8 dst, u8 src1, u8 src2
+
+    // Pops hi, lo, array (in that order); pushes a new array of a[lo:hi].
+    OP_SLICE = 153,
+
+    OP_NEW_MAP = 154, // u16 count, pops 2*count values (key,val pairs)
+    OP_MGET = 155,    // pops key, map; pushes the value
+    OP_MSET = 156     // pops val, key, map
 } opcode;
 
 typedef enum { C_INT, C_FLOAT, C_STR } const_kind;

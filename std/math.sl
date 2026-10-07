@@ -4,9 +4,8 @@
 // The `extern` declarations are backed by native code, and everything else is
 // ordinary Solis.
 //
-// Note there is no overloading and no generics, so int and float versions are
-// separate functions. `maxf` is the float twin of `max`. That is the honest
-// cost of the trim, and it is better than pretending.
+// Note there is no overloading, so int and float versions are separate
+// functions regardless of generics. `maxf` is the float twin of `max`.
 
 // Solis never converts between int and float implicitly, so these are the only
 // way across. You will reach for `toFloat` constantly when averaging.
@@ -94,4 +93,14 @@ func degrees(radians: float): float {
 
 func radians(degrees: float): float {
     return degrees * PI / 180.0;
+}
+
+func range(start: int, end: int): [int] {
+    var out: [int] = [];
+    var i = 0;
+    while i < end - start {
+        push(out, i + start);
+        i = i + 1;
+    }
+    return out;
 }

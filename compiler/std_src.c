@@ -63,6 +63,26 @@ static const char src_rand[] = {
     , 0
 };
 
+static const char src_option[] = {
+#embed "../std/option.sl"
+    , 0
+};
+
+static const char src_result[] = {
+#embed "../std/result.sl"
+    , 0
+};
+
+static const char src_test[] = {
+#embed "../std/test.sl"
+    , 0
+};
+
+static const char src_map[] = {
+#embed "../std/map.sl"
+    , 0
+};
+
 #pragma GCC diagnostic pop
 
 #else
@@ -81,5 +101,9 @@ const char *stdlib_source(const char *name) {
     if (strcmp(name, "os") == 0) return src_os;
     if (strcmp(name, "time") == 0) return src_time;
     if (strcmp(name, "rand") == 0) return src_rand;
+    if (strcmp(name, "option") == 0) return src_option;
+    if (strcmp(name, "result") == 0) return src_result;
+    if (strcmp(name, "test") == 0) return src_test;
+    if (strcmp(name, "map") == 0) return src_map;
     return NULL;
 }

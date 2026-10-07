@@ -228,6 +228,24 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
         const char *name = callee->as.field.name;
         const char *chain = static_path(G->a, base);
 
+        // Generic enum variant, e.g. `Option.Some(x)`.
+        if (chain && x->hint && x->hint->kind == TK_NAMED) {
+            elayout *el = (elayout *)map_get(&G->elayouts, x->hint->name);
+            if (el) {
+                for (int tag = 0; tag < el->variants.len; tag++) {
+                    if (strcmp(el->variants.at[tag].name, name) != 0) continue;
+                    for (int i = 0; i < args->len; i++) {
+                        ty *t = gen_expr(G, args->at[i], e);
+                        maybe_copy(G, t, e);
+                    }
+                    em_op(e, OP_NEW_VARIANT);
+                    em_u16(e, (uint16_t)tag);
+                    em_u8(e, (uint8_t)args->len);
+                    return x->hint;
+                }
+            }
+        }
+
         // `module.func(..)` is a plain call to a qualified name.
         if (chain && is_module(G, chain)) {
             const char *q = arena_printf(G->a, "%s.%s", chain, name);
@@ -258,18 +276,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
         }
 
         if (!is_type_path) {
-            // Builtins that act on a value.
-            if (strcmp(name, "len") == 0 || strcmp(name, "push") == 0) {
-                gen_expr(G, base, e);
-                for (int i = 0; i < args->len; i++) {
-                    ty *t = gen_expr(G, args->at[i], e);
-                    if (strcmp(name, "push") == 0) maybe_copy(G, t, e);
-                }
-                em_op(e, strcmp(name, "len") == 0 ? OP_ALEN : OP_APUSH);
-                return strcmp(name, "len") == 0 ? ty_int() : ty_void();
-            }
-
-            // Method call on a value: the receiver is a hidden first argument.
+            // Real methods win over the len/push builtins below.
             ty *bt = gen_expr(G, base, e);
             if (bt->kind == TK_NAMED) {
                 const char *q = arena_printf(G->a, "%s.%s", bt->name, name);
@@ -282,6 +289,18 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
                     return sig_ret(G, q);
                 }
             }
+
+            // Builtins that act on an array value.
+            if (bt->kind == TK_ARRAY &&
+                (strcmp(name, "len") == 0 || strcmp(name, "push") == 0)) {
+                for (int i = 0; i < args->len; i++) {
+                    ty *t = gen_expr(G, args->at[i], e);
+                    if (strcmp(name, "push") == 0) maybe_copy(G, t, e);
+                }
+                em_op(e, strcmp(name, "len") == 0 ? OP_ALEN : OP_APUSH);
+                return strcmp(name, "len") == 0 ? ty_int() : ty_void();
+            }
+
             gerr(G, at, NULL, arena_printf(G->a, "unknown method `%s`", name));
             return ty_error();
         }
@@ -320,11 +339,14 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
         return ty_error();
     }
     const char *name = callee->as.p.seg[0];
+    const char *q = qualify(G, name);
+    bool has_local = q && (map_has(&G->d->externs, q) || map_has(&G->func_ids, q));
 
     // Global builtins. `len` and `push` are instructions; the rest are
     // natives, which the runtime pre-registers for pure maths and leaves to
-    // the host for anything that touches the world.
-    if (strcmp(name, "len") == 0 || strcmp(name, "push") == 0) {
+    // the host for anything that touches the world. A module's own function
+    // of the same name wins (e.g. strings.sl's own `indexOf`).
+    if (!has_local && (strcmp(name, "len") == 0 || strcmp(name, "push") == 0)) {
         for (int i = 0; i < args->len; i++) {
             ty *t = gen_expr(G, args->at[i], e);
             if (strcmp(name, "push") == 0) maybe_copy(G, t, e);
@@ -332,8 +354,14 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
         em_op(e, strcmp(name, "len") == 0 ? OP_ALEN : OP_APUSH);
         return strcmp(name, "len") == 0 ? ty_int() : ty_void();
     }
-    if (strcmp(name, "print") == 0 || strcmp(name, "sqrt") == 0 ||
-        strcmp(name, "abs") == 0) {
+    if (!has_local &&
+        (strcmp(name, "print") == 0 || strcmp(name, "sqrt") == 0 ||
+         strcmp(name, "abs") == 0 || strcmp(name, "pop") == 0 ||
+         strcmp(name, "indexOf") == 0 || strcmp(name, "contains") == 0 ||
+         strcmp(name, "reverse") == 0 || strcmp(name, "removeAt") == 0 ||
+         strcmp(name, "insertAt") == 0 || strcmp(name, "sort") == 0 ||
+         strcmp(name, "removeKey") == 0 || strcmp(name, "keys") == 0 ||
+         strcmp(name, "values") == 0)) {
         ty *arg_ty = ty_error();
         for (int i = 0; i < args->len; i++) {
             ty *t = gen_expr(G, args->at[i], e);
@@ -342,13 +370,23 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
         em_op(e, OP_NATIVE);
         em_u16(e, bc_add_native(G->prog, intern_z(G->in, name)));
         em_u8(e, (uint8_t)args->len);
-        if (strcmp(name, "print") == 0) return ty_void();
+        if (strcmp(name, "print") == 0 || strcmp(name, "reverse") == 0 ||
+            strcmp(name, "insertAt") == 0 || strcmp(name, "sort") == 0) return ty_void();
         if (strcmp(name, "sqrt") == 0) return ty_float();
+        if (strcmp(name, "indexOf") == 0) return ty_int();
+        if (strcmp(name, "contains") == 0) return ty_bool();
+        if (strcmp(name, "pop") == 0 || strcmp(name, "removeAt") == 0)
+            return arg_ty->kind == TK_ARRAY ? arg_ty->elem : ty_error();
+        if (strcmp(name, "removeKey") == 0)
+            return arg_ty->kind == TK_MAP ? arg_ty->val : ty_error();
+        if (strcmp(name, "keys") == 0)
+            return ty_array(G->a, arg_ty->kind == TK_MAP ? arg_ty->key : ty_error());
+        if (strcmp(name, "values") == 0)
+            return ty_array(G->a, arg_ty->kind == TK_MAP ? arg_ty->val : ty_error());
         return arg_ty;      // `abs` keeps its argument's type
     }
 
     for (int i = 0; i < args->len; i++) gen_expr(G, args->at[i], e);
-    const char *q = qualify(G, name);
 
     // Not declared here, but the prelude has it: the checker already resolved
     // the call that way, so use the same name.
@@ -436,6 +474,16 @@ static ty *gen_binary(gen *G, expr *x, emitter *e) {
     if (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV || op == OP_REM) {
         gen_arith(G, op, t, x->at, e);
         return t;
+    }
+
+    // A bare type param: the static type can't pick a typed opcode here, so
+    // fall back to runtime-tag equality instead of silently defaulting wrong.
+    if (t->kind == TK_PARAM && (op == OP_EQ || op == OP_NE)) {
+        em_op(e, OP_NATIVE);
+        em_u16(e, bc_add_native(G->prog, intern_z(G->in, " eq")));
+        em_u8(e, 2);
+        if (op == OP_NE) em_op(e, OP_NOT);
+        return ty_bool();
     }
 
     opcode o = OP_EQ_I;
@@ -556,12 +604,43 @@ static ty *gen_expr(gen *G, expr *x, emitter *e) {
         case EX_INDEX: {
             ty *bt = gen_expr(G, x->as.index.base, e);
             gen_expr(G, x->as.index.index, e);
+            if (bt->kind == TK_MAP) {
+                em_op(e, OP_MGET);
+                return bt->val;
+            }
             em_op(e, OP_AGET);
             return bt->kind == TK_ARRAY ? bt->elem : ty_error();
         }
 
+        case EX_SLICE: {
+            ty *bt = gen_expr(G, x->as.slice.base, e);
+            uint8_t slot = fresh(G, bt);
+            em_op(e, OP_STORE);
+            em_u8(e, slot);
+
+            em_op(e, OP_LOAD);
+            em_u8(e, slot);
+            if (x->as.slice.lo) {
+                gen_expr(G, x->as.slice.lo, e);
+            } else {
+                em_op(e, OP_CONST_I8);
+                em_u8(e, 0);
+            }
+            if (x->as.slice.hi) {
+                gen_expr(G, x->as.slice.hi, e);
+            } else {
+                em_op(e, OP_LOAD);
+                em_u8(e, slot);
+                em_op(e, OP_ALEN);
+            }
+            em_op(e, OP_SLICE);
+            return bt;
+        }
+
         case EX_STRUCT_LIT: {
-            const char *name = qualify(G, path_text(G->a, &x->as.struct_lit.p));
+            const char *name = x->hint && x->hint->kind == TK_NAMED
+                ? x->hint->name
+                : qualify(G, path_text(G->a, &x->as.struct_lit.p));
             layout *l = (layout *)map_get(&G->layouts, name);
             if (!l) {
                 gerr(G, x->at, NULL,
@@ -653,9 +732,20 @@ static ty *gen_expr(gen *G, expr *x, emitter *e) {
             em_op(e, OP_NULL);
             return ty_null_lit();
 
-        case EX_MAP:
-            gerr(G, x->at, NULL, "maps are not supported");
-            return ty_error();
+        case EX_MAP: {
+            ty *kt = ty_error(), *vt = ty_error();
+            for (int i = 0; i < x->as.map.len; i++) {
+                ty *k = gen_expr(G, x->as.map.at[i].k, e);
+                maybe_copy(G, k, e);
+                ty *v = gen_expr(G, x->as.map.at[i].v, e);
+                maybe_copy(G, v, e);
+                if (i == 0) { kt = k; vt = v; }
+            }
+            em_op(e, OP_NEW_MAP);
+            em_u16(e, (uint16_t)x->as.map.len);
+            if (x->as.map.len == 0 && x->hint) return x->hint;
+            return ty_map(G->a, kt, vt);
+        }
     }
     return ty_error();
 }
@@ -751,19 +841,20 @@ static void gen_assign(gen *G, stmt *s, emitter *e) {
     if (place->kind == EX_INDEX) {
         ty *bt = gen_expr(G, place->as.index.base, e);
         gen_expr(G, place->as.index.index, e);
+        bool is_map = bt->kind == TK_MAP;
         if (op == ASSIGN_SET) {
             ty *vt = gen_expr(G, value, e);
             maybe_copy(G, vt, e);
         } else {
-            ty *elem = bt->kind == TK_ARRAY ? bt->elem : ty_error();
-            // Keep the array and index for the store, and take a second copy
-            // of each to do the read.
+            ty *elem = is_map ? bt->val : bt->kind == TK_ARRAY ? bt->elem : ty_error();
+            // Keep the array/map and index/key for the store, and take a
+            // second copy of each to do the read.
             em_op(e, OP_DUP2);
-            em_op(e, OP_AGET);
+            em_op(e, is_map ? OP_MGET : OP_AGET);
             gen_expr(G, value, e);
             gen_arith(G, bin_of(op), elem, at, e);
         }
-        em_op(e, OP_ASET);
+        em_op(e, is_map ? OP_MSET : OP_ASET);
         return;
     }
 
@@ -1048,6 +1139,10 @@ static void gen_stmt(gen *G, stmt *s, emitter *e) {
     }
 }
 
+static const char *qual_name(arena *a, const char *mod, const char *name) {
+    return strchr(name, '.') ? name : arena_printf(a, "%s.%s", mod, name);
+}
+
 static void declare_fn(gen *G, const char *q, func *f, bool is_extern, fn_sig *sig) {
     if (!is_extern) {
         uint16_t id = (uint16_t)G->prog->funcs.len;
@@ -1259,14 +1354,12 @@ bc_program *generate(arena *a, sl_interner *in, loaded *l, decls *d, diag_vec *d
                 const char *q = arena_printf(a, "%s.%s", m->name, it->as.fn->name);
                 declare_fn(&G, q, it->as.fn, it->kind == IT_EXTERN,
                            (fn_sig *)map_get(&d->funcs, q));
-            } else if (it->kind == IT_STRUCT) {
-                struct_info *si =
-                    (struct_info *)map_get(&d->structs,
-                                           arena_printf(a, "%s.%s", m->name, it->as.st->name));
+            } else if (it->kind == IT_STRUCT && it->as.st->generics.len == 0) {
+                const char *sq = qual_name(a, m->name, it->as.st->name);
+                struct_info *si = (struct_info *)map_get(&d->structs, sq);
                 for (int k = 0; k < it->as.st->methods.len; k++) {
                     func *mt = it->as.st->methods.at[k];
-                    const char *q = arena_printf(a, "%s.%s.%s", m->name, it->as.st->name,
-                                                 mt->name);
+                    const char *q = arena_printf(a, "%s.%s", sq, mt->name);
                     declare_fn(&G, q, mt, false,
                                si ? sig_lookup(&si->methods, mt->name) : NULL);
                 }
@@ -1283,15 +1376,12 @@ bc_program *generate(arena *a, sl_interner *in, loaded *l, decls *d, diag_vec *d
                 G.this_ty = NULL;
                 compile_body(&G, arena_printf(a, "%s.%s", m->name, it->as.fn->name),
                              it->as.fn);
-            } else if (it->kind == IT_STRUCT) {
+            } else if (it->kind == IT_STRUCT && it->as.st->generics.len == 0) {
+                const char *sq = qual_name(a, m->name, it->as.st->name);
                 for (int k = 0; k < it->as.st->methods.len; k++) {
                     func *mt = it->as.st->methods.at[k];
-                    G.this_ty = mt->is_static
-                        ? NULL
-                        : ty_named(a, intern_z(in, arena_printf(a, "%s.%s", m->name,
-                                                                it->as.st->name)));
-                    compile_body(&G, arena_printf(a, "%s.%s.%s", m->name, it->as.st->name,
-                                                  mt->name), mt);
+                    G.this_ty = mt->is_static ? NULL : ty_named(a, intern_z(in, sq));
+                    compile_body(&G, arena_printf(a, "%s.%s", sq, mt->name), mt);
                 }
             }
         }

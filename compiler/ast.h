@@ -94,13 +94,22 @@ struct func {
 
 typedef VEC(func *) func_vec;
 
+// An entry in a `: iface_list`, e.g. `Comparable` or `Container[T]`.
 typedef struct {
-    const char *name;
-    generic_vec generics;
-    path_vec    implements;
-    field_vec   fields;
-    func_vec    methods;
-    span        at;
+    path     p;
+    type_vec args;
+    span     at;
+} iface_ref;
+
+typedef VEC(iface_ref) iface_ref_vec;
+
+typedef struct {
+    const char   *name;
+    generic_vec   generics;
+    iface_ref_vec implements;
+    field_vec     fields;
+    func_vec      methods;
+    span          at;
 } struct_decl;
 
 typedef struct {
@@ -240,7 +249,7 @@ typedef VEC(map_entry) map_entry_vec;
 
 typedef enum {
     EX_INT, EX_FLOAT, EX_BOOL, EX_NULL, EX_STR, EX_PATH, EX_THIS,
-    EX_UNARY, EX_BINARY, EX_CALL, EX_INDEX, EX_FIELD, EX_STRUCT_LIT,
+    EX_UNARY, EX_BINARY, EX_CALL, EX_INDEX, EX_SLICE, EX_FIELD, EX_STRUCT_LIT,
     EX_ARRAY, EX_MAP
 } expr_kind;
 
@@ -263,6 +272,8 @@ struct expr {
         struct { bin_op op; expr *lhs, *rhs; } binary;
         struct { expr *callee; expr_vec args; } call;
         struct { expr *base, *index; } index;
+        // `a[lo:hi]`; either bound may be NULL (`a[:]`, `a[i:]`, `a[:j]`).
+        struct { expr *base, *lo, *hi; } slice;
         // `a.b`, or `a?.b` when optional is set.
         struct { expr *base; const char *name; bool optional; } field;
         struct { path p; field_init_vec fields; } struct_lit;

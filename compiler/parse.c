@@ -351,9 +351,22 @@ static struct_decl *parse_struct(parser *P) {
 
     if (eat(P, T_COLON)) {
         for (;;) {
-            path p;
-            if (!parse_path(P, &p)) return NULL;
-            vec_push(P->a, &s->implements, p);
+            iface_ref ref;
+            memset(&ref, 0, sizeof ref);
+            span rstart = cur_span(P);
+            if (!parse_path(P, &ref.p)) return NULL;
+            if (check(P, T_LBRACKET)) {
+                advance(P);
+                for (;;) {
+                    type *ta = parse_type(P);
+                    if (!ta) return NULL;
+                    vec_push(P->a, &ref.args, ta);
+                    if (!eat(P, T_COMMA)) break;
+                }
+                if (!expect(P, T_RBRACKET)) return NULL;
+            }
+            ref.at = span_to(rstart, prev_span(P));
+            vec_push(P->a, &s->implements, ref);
             if (!eat(P, T_COMMA)) break;
         }
     }
@@ -1006,13 +1019,35 @@ static expr *parse_postfix(parser *P) {
             }
             case T_LBRACKET: {
                 advance(P);
-                expr *idx = parse_expr(P);
-                if (!idx) return NULL;
+                expr *lo = NULL, *hi = NULL;
+                bool is_slice = false;
+                if (check(P, T_COLON)) {
+                    is_slice = true;
+                    advance(P);
+                } else {
+                    if (!(lo = parse_expr(P))) return NULL;
+                    if (check(P, T_COLON)) {
+                        is_slice = true;
+                        advance(P);
+                    }
+                }
+                if (is_slice) {
+                    if (!check(P, T_RBRACKET) && !(hi = parse_expr(P))) return NULL;
+                    if (!expect(P, T_RBRACKET)) return NULL;
+                    expr *sl = NEW(P->a, expr);
+                    sl->kind = EX_SLICE;
+                    sl->as.slice.base = e;
+                    sl->as.slice.lo = lo;
+                    sl->as.slice.hi = hi;
+                    sl->at = span_to(e->at, prev_span(P));
+                    e = sl;
+                    break;
+                }
                 if (!expect(P, T_RBRACKET)) return NULL;
                 expr *ix = NEW(P->a, expr);
                 ix->kind = EX_INDEX;
                 ix->as.index.base = e;
-                ix->as.index.index = idx;
+                ix->as.index.index = lo;
                 ix->at = span_to(e->at, prev_span(P));
                 e = ix;
                 break;

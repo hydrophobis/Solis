@@ -29,7 +29,8 @@ typedef enum {
     SL_STR = 0,
     SL_ARRAY,
     SL_STRUCT,
-    SL_VARIANT
+    SL_VARIANT,
+    SL_MAP
 } sl_obj_kind;
 
 typedef struct sl_obj sl_obj;
@@ -89,11 +90,26 @@ sl_value    sl_str(sl_vm *vm, const char *bytes, size_t n);
 sl_value    sl_cstr(sl_vm *vm, const char *z);
 const char *sl_as_str(sl_value v, size_t *len_out);
 
-// sl_array_push takes ownership of `item`; don't release it afterwards.
+// sl_array_push/set/insert take ownership of `item`; don't release it
+// afterwards. sl_array_get/pop/remove hand ownership to the caller instead.
 sl_value    sl_array(sl_vm *vm, int64_t count);
 int64_t     sl_array_len(sl_value v);
 sl_value    sl_array_get(sl_value v, int64_t i);
 bool        sl_array_push(sl_vm *vm, sl_value arr, sl_value item);
+bool        sl_array_set(sl_vm *vm, sl_value arr, int64_t i, sl_value item);
+bool        sl_array_pop(sl_vm *vm, sl_value arr, sl_value *out);
+bool        sl_array_remove(sl_vm *vm, sl_value arr, int64_t i, sl_value *out);
+bool        sl_array_insert(sl_vm *vm, sl_value arr, int64_t i, sl_value item);
+
+// sl_map_set takes ownership of `key`/`val`. sl_map_get hands the stored
+// value back borrowed; sl_map_remove hands both back owned. Lookup is
+// O(n) linear scan over key/value pairs, not a hash table.
+sl_value    sl_map(sl_vm *vm, int64_t cap);
+int64_t     sl_map_len(sl_value v);
+bool        sl_map_get(sl_value m, sl_value key, sl_value *out);
+bool        sl_map_set(sl_vm *vm, sl_value m, sl_value key, sl_value val);
+bool        sl_map_remove(sl_vm *vm, sl_value m, sl_value key, sl_value *out);
+bool        sl_map_pair_at(sl_value m, int64_t i, sl_value *key_out, sl_value *val_out);
 
 // Render any value the way `print` does. Returns a VM-owned string value.
 sl_value    sl_to_string(sl_vm *vm, sl_value v);

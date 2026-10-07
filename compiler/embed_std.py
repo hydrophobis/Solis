@@ -20,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "..", "std")
 OUT = os.path.join(HERE, "std_fallback.h")
 
-MODULES = ["math", "strings", "io", "fs", "os", "time", "rand"]
+MODULES = ["math", "strings", "io", "fs", "os", "time", "rand", "option", "result", "test", "map"]
 
 
 def c_escape(text):

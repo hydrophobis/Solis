@@ -35,6 +35,19 @@ typedef struct {
     const char       *current_module;
     const char       *prelude;      // the ambient module, or NULL
     VEC(const char *) imports;
+
+    // Generic structs/enums: collected here instead of `d->structs`/`enums`,
+    // and monomorphised on demand (see instantiate_struct/instantiate_enum).
+    map struct_tmpls;    // qualified name -> struct_decl*
+    map enum_tmpls;      // qualified name -> enum_decl*
+    map iface_tmpls;     // qualified name -> interface_decl*
+    map instantiated;    // mangled qualified name -> done-or-in-progress
+    // Lets check_conformance/check_cycles re-run after check_bodies without
+    // double-reporting what their first pass already covered.
+    map conformance_checked;
+    map cycles_checked;
+    VEC(named_ty) active_subst;   // generic param name -> its concrete ty here
+    program *current_prog;        // the module being collect_details'd
 } checker;
 
 fn_sig *sig_lookup(const sig_vec *methods, const char *name) {
@@ -79,14 +92,20 @@ static const char *prelude_name(checker *C, const char *written) {
     return arena_printf(C->a, "%s.%s", C->prelude, written);
 }
 
-// `[]` has no element to infer from, so it takes the type it is checked
-// against. Stashes the type on the node for codegen, which has the same
-// problem. Returns the type the expression should now be considered.
-static ty *adopt_empty_array(expr *v, ty *got, ty *want) {
-    if (!v || v->kind != EX_ARRAY || v->as.array.len != 0) return got;
-    if (!want || want->kind != TK_ARRAY) return got;
-    v->hint = want;
-    return want;
+// `[]`/`{}` have no element to infer from, so they take the type they're
+// checked against. Stashes the type on the node for codegen, which has the
+// same problem. Returns the type the expression should now be considered.
+static ty *adopt_empty_literal(expr *v, ty *got, ty *want) {
+    if (!v || !want) return got;
+    if (v->kind == EX_ARRAY && v->as.array.len == 0 && want->kind == TK_ARRAY) {
+        v->hint = want;
+        return want;
+    }
+    if (v->kind == EX_MAP && v->as.map.len == 0 && want->kind == TK_MAP) {
+        v->hint = want;
+        return want;
+    }
+    return got;
 }
 
 static bool is_visible_module(checker *C, const char *name) {
@@ -131,6 +150,15 @@ static ty *resolve_ty(checker *C, type *t);
 static ty *field_or_method_ty(checker *C, ty *base, const char *name, span at);
 static ty *check_path(checker *C, path *p, span at);
 
+static ty *find_subst(checker *C, const char *name);
+static const char *instantiate_struct(checker *C, const char *qbase, struct_decl *tmpl,
+                                       ty_vec args, span at);
+static const char *instantiate_enum(checker *C, const char *qbase, enum_decl *tmpl,
+                                     ty_vec args, span at);
+static const char *instantiate_interface(checker *C, const char *qbase, interface_decl *tmpl,
+                                          ty_vec args, span at);
+static void resolve_implements(checker *C, struct_info *si, iface_ref_vec *refs);
+
 static ty *sig_as_func_ty(checker *C, const fn_sig *sig) {
     ty_vec ps;
     memset(&ps, 0, sizeof ps);
@@ -145,17 +173,23 @@ static ty *resolve_ty(checker *C, type *t) {
             const char *n = path_text(C->a, &t->as.named.p);
 
             if (t->as.named.args.len) {
-                // Built-in generic containers have their own syntax; a
-                // user-defined generic type is not supported.
                 ty_vec resolved;
                 memset(&resolved, 0, sizeof resolved);
                 for (int i = 0; i < t->as.named.args.len; i++)
                     vec_push(C->a, &resolved, resolve_ty(C, t->as.named.args.at[i]));
                 if (strcmp(n, "Map") == 0 && resolved.len == 2)
                     return ty_map(C->a, resolved.at[0], resolved.at[1]);
+
+                const char *q = qualify(C, n);
+                struct_decl *stmpl = q ? (struct_decl *)map_get(&C->struct_tmpls, q) : NULL;
+                if (stmpl)
+                    return ty_named(C->a, instantiate_struct(C, q, stmpl, resolved, t->at));
+                enum_decl *etmpl = q ? (enum_decl *)map_get(&C->enum_tmpls, q) : NULL;
+                if (etmpl)
+                    return ty_named(C->a, instantiate_enum(C, q, etmpl, resolved, t->at));
+
                 cerr_help(C, t->at,
-                          "user-defined generic types are not implemented yet; "
-                          "use `[T]` for arrays and `{K: V}` for maps",
+                          "`Map` is the only built-in generic type",
                           arena_printf(C->a, "`%s` is not a generic type", n));
                 return ty_error();
             }
@@ -165,6 +199,10 @@ static ty *resolve_ty(checker *C, type *t) {
             if (strcmp(n, "bool") == 0) return ty_bool();
             if (strcmp(n, "str") == 0) return ty_str();
 
+            {
+                ty *sub = find_subst(C, n);
+                if (sub) return sub;
+            }
             if (find_type_param(C, n)) return ty_param(C->a, n);
 
             const char *q = qualify(C, n);
@@ -249,12 +287,348 @@ static fn_sig *sig_of(checker *C, func *f) {
     return sig;
 }
 
+// --- Generic structs/enums: monomorphised on demand -------------------------
+//
+// A generic struct/enum is never registered into `d->structs`/`d->enums`
+// directly (see collect_names); it sits in struct_tmpls/enum_tmpls instead.
+// The first concrete use (`Stack[int]` in a type, or a hinted literal)
+// mangles a name, substitutes the args for the template's generics while
+// resolving its fields/methods/variants, and appends the result as an
+// ordinary IT_STRUCT/IT_ENUM item so collect_details/check_bodies/codegen
+// process it exactly as if it had been written by hand. Same-module only:
+// qualify() needs `current_module` to match, which this doesn't try to swap.
+
+static ty *find_subst(checker *C, const char *name) {
+    for (int i = C->active_subst.len - 1; i >= 0; i--)
+        if (strcmp(C->active_subst.at[i].name, name) == 0) return C->active_subst.at[i].t;
+    return NULL;
+}
+
+static const char *flatten_dots(arena *a, const char *s) {
+    size_t n = strlen(s);
+    char *buf = (char *)arena_alloc(a, n + 1);
+    for (size_t i = 0; i <= n; i++) buf[i] = s[i] == '.' ? '_' : s[i];
+    return buf;
+}
+
+static const char *mangle(arena *a, const char *qbase, ty_vec args) {
+    const char *out = arena_printf(a, "%s[", qbase);
+    for (int i = 0; i < args.len; i++) {
+        const char *arg = flatten_dots(a, ty_show(a, args.at[i]));
+        out = i == 0 ? arena_printf(a, "%s%s", out, arg)
+                     : arena_printf(a, "%s,%s", out, arg);
+    }
+    return arena_printf(a, "%s]", out);
+}
+
+// Does `arg` implement the interface named `bound` (written in the
+// template's own module)? Primitives implement nothing today.
+static bool satisfies_bound(checker *C, ty *arg, const char *bound) {
+    if (arg->kind != TK_NAMED) return false;
+    struct_info *si = (struct_info *)map_get(&C->d->structs, arg->name);
+    if (!si) return false;
+    const char *dot = strchr(arg->name, '.');
+    size_t mn = dot ? (size_t)(dot - arg->name) : strlen(arg->name);
+    const char *want = strchr(bound, '.') ? bound : qualify(C, bound);
+    if (!want) return false;
+    for (int k = 0; k < si->implements.len; k++) {
+        const char *iname = si->implements.at[k].name;
+        const char *key = strchr(iname, '.') ? iname
+                           : arena_printf(C->a, "%.*s.%s", (int)mn, arg->name, iname);
+        if (strcmp(key, want) == 0) return true;
+    }
+    return false;
+}
+
+// Matches `pattern` (may contain TK_PARAM named in `params`) against a fully
+// resolved `concrete`, filling `bound[i]` (parallel to `params`) the first
+// time each param is pinned down and checking consistency after that.
+static bool unify(ty *pattern, ty *concrete, generic_vec *params, ty_vec *bound) {
+    if (concrete->kind == TK_ERROR) return true;
+    if (pattern->kind == TK_PARAM) {
+        for (int i = 0; i < params->len; i++) {
+            if (strcmp(params->at[i].name, pattern->name) != 0) continue;
+            if (!bound->at[i]) { bound->at[i] = concrete; return true; }
+            return ty_eq(bound->at[i], concrete);
+        }
+        return false;
+    }
+    if (concrete->kind == TK_NULL_LIT) return ty_is_reference(pattern);
+    if (pattern->kind != concrete->kind) return false;
+    switch (pattern->kind) {
+        case TK_ARRAY: return unify(pattern->elem, concrete->elem, params, bound);
+        case TK_MAP:
+            return unify(pattern->key, concrete->key, params, bound) &&
+                   unify(pattern->val, concrete->val, params, bound);
+        case TK_FUNC: {
+            if (pattern->params.len != concrete->params.len) return false;
+            for (int i = 0; i < pattern->params.len; i++)
+                if (!unify(pattern->params.at[i], concrete->params.at[i], params, bound))
+                    return false;
+            return unify(pattern->ret, concrete->ret, params, bound);
+        }
+        default: return ty_eq(pattern, concrete);
+    }
+}
+
+// Replaces each TK_PARAM in `t` with its binding from `unify`, or ty_error()
+// if a param never got pinned down (already diagnosed by the caller).
+static ty *subst_call_ty(checker *C, ty *t, generic_vec *params, ty_vec *bound) {
+    switch (t->kind) {
+        case TK_PARAM:
+            for (int i = 0; i < params->len; i++)
+                if (strcmp(params->at[i].name, t->name) == 0)
+                    return bound->at[i] ? bound->at[i] : ty_error();
+            return t;
+        case TK_ARRAY: return ty_array(C->a, subst_call_ty(C, t->elem, params, bound));
+        case TK_MAP:
+            return ty_map(C->a, subst_call_ty(C, t->key, params, bound),
+                          subst_call_ty(C, t->val, params, bound));
+        case TK_FUNC: {
+            ty_vec ps;
+            memset(&ps, 0, sizeof ps);
+            for (int i = 0; i < t->params.len; i++)
+                vec_push(C->a, &ps, subst_call_ty(C, t->params.at[i], params, bound));
+            return ty_func(C->a, ps, subst_call_ty(C, t->ret, params, bound));
+        }
+        default: return t;
+    }
+}
+
+// `f[T](x: T)` calls: unify T from the arguments, since there's no call-site
+// `f[int](x)` syntax (no turbofish, by design). The body was already checked
+// once with T opaque, so no per-call recompilation is needed here.
+static ty *check_generic_call(checker *C, expr *e, fn_sig *sig, expr_vec *args) {
+    if (args->len != sig->params.len)
+        cerr(C, e->at, arena_printf(C->a, "this call takes %d argument(s) but %d were supplied",
+                                     sig->params.len, args->len));
+
+    ty_vec bound;
+    memset(&bound, 0, sizeof bound);
+    for (int i = 0; i < sig->generics.len; i++) vec_push(C->a, &bound, (ty *)0);
+
+    int n = args->len < sig->params.len ? args->len : sig->params.len;
+    for (int i = 0; i < n; i++) {
+        ty *got = check_expr(C, args->at[i]);
+        got = adopt_empty_literal(args->at[i], got, sig->params.at[i].t);
+        if (!unify(sig->params.at[i].t, got, &sig->generics, &bound))
+            cerr(C, args->at[i]->at,
+                 arena_printf(C->a, "expected `%s`, found `%s`",
+                              ty_show(C->a, sig->params.at[i].t), ty_show(C->a, got)));
+    }
+    for (int i = n; i < args->len; i++) check_expr(C, args->at[i]);
+
+    for (int i = 0; i < sig->generics.len; i++) {
+        if (!bound.at[i]) {
+            cerr(C, e->at, arena_printf(C->a, "cannot infer type argument `%s`",
+                                         sig->generics.at[i].name));
+            bound.at[i] = ty_error();
+            continue;
+        }
+        for (int b = 0; b < sig->generics.at[i].bounds.len; b++) {
+            const char *bn = path_text(C->a, &sig->generics.at[i].bounds.at[b]);
+            if (!satisfies_bound(C, bound.at[i], bn))
+                cerr(C, e->at, arena_printf(C->a, "`%s` does not implement `%s`",
+                                             ty_show(C->a, bound.at[i]), bn));
+        }
+    }
+
+    return subst_call_ty(C, sig->ret, &sig->generics, &bound);
+}
+
+static const char *instantiate_struct(checker *C, const char *qbase, struct_decl *tmpl,
+                                       ty_vec args, span at) {
+    const char *mangled = intern_z(C->in, mangle(C->a, qbase, args));
+    if (map_has(&C->instantiated, mangled)) return mangled;
+    map_put(&C->instantiated, mangled, (void *)1);
+
+    if (tmpl->generics.len != args.len) {
+        cerr(C, at, arena_printf(C->a, "`%s` takes %d type argument(s), found %d",
+                                  qbase, tmpl->generics.len, args.len));
+        return mangled;
+    }
+    for (int i = 0; i < tmpl->generics.len; i++)
+        for (int b = 0; b < tmpl->generics.at[i].bounds.len; b++) {
+            const char *bn = path_text(C->a, &tmpl->generics.at[i].bounds.at[b]);
+            if (!satisfies_bound(C, args.at[i], bn))
+                cerr(C, at, arena_printf(C->a,
+                     "`%s` does not implement `%s`, required by `%s`'s bound on `%s`",
+                     ty_show(C->a, args.at[i]), bn, qbase, tmpl->generics.at[i].name));
+        }
+
+    struct_decl *clone = NEW(C->a, struct_decl);
+    *clone = *tmpl;
+    clone->name = mangled;
+    memset(&clone->generics, 0, sizeof clone->generics);
+
+    struct_info *si = NEW(C->a, struct_info);
+    si->at = at;
+    map_put(&C->d->structs, mangled, si);
+
+    int mark = C->active_subst.len;
+    for (int i = 0; i < tmpl->generics.len; i++) {
+        named_ty nt;
+        nt.name = tmpl->generics.at[i].name;
+        nt.t = args.at[i];
+        vec_push(C->a, &C->active_subst, nt);
+    }
+
+    for (int k = 0; k < clone->fields.len; k++) {
+        field *f = &clone->fields.at[k];
+        field_info fi;
+        fi.name = f->name;
+        fi.t = resolve_ty(C, f->ty);
+        fi.is_weak = f->is_weak;
+        fi.at = f->at;
+        vec_push(C->a, &si->fields, fi);
+    }
+    for (int k = 0; k < clone->methods.len; k++)
+        vec_push(C->a, &si->methods, sig_of(C, clone->methods.at[k]));
+    resolve_implements(C, si, &clone->implements);
+
+    C->active_subst.len = mark;
+
+    item it;
+    memset(&it, 0, sizeof it);
+    it.kind = IT_STRUCT;
+    it.as.st = clone;
+    vec_push(C->a, &C->current_prog->items, it);
+
+    return mangled;
+}
+
+static const char *instantiate_enum(checker *C, const char *qbase, enum_decl *tmpl,
+                                     ty_vec args, span at) {
+    const char *mangled = intern_z(C->in, mangle(C->a, qbase, args));
+    if (map_has(&C->instantiated, mangled)) return mangled;
+    map_put(&C->instantiated, mangled, (void *)1);
+
+    if (tmpl->generics.len != args.len) {
+        cerr(C, at, arena_printf(C->a, "`%s` takes %d type argument(s), found %d",
+                                  qbase, tmpl->generics.len, args.len));
+        return mangled;
+    }
+
+    enum_decl *clone = NEW(C->a, enum_decl);
+    *clone = *tmpl;
+    clone->name = mangled;
+    memset(&clone->generics, 0, sizeof clone->generics);
+
+    enum_info *ei = NEW(C->a, enum_info);
+    ei->at = at;
+    map_put(&C->d->enums, mangled, ei);
+
+    int mark = C->active_subst.len;
+    for (int i = 0; i < tmpl->generics.len; i++) {
+        named_ty nt;
+        nt.name = tmpl->generics.at[i].name;
+        nt.t = args.at[i];
+        vec_push(C->a, &C->active_subst, nt);
+    }
+
+    for (int k = 0; k < clone->variants.len; k++) {
+        variant *v = &clone->variants.at[k];
+        variant_info vi;
+        memset(&vi, 0, sizeof vi);
+        vi.name = v->name;
+        for (int j = 0; j < v->payload.len; j++) {
+            named_ty nt;
+            nt.name = v->payload.at[j].name;
+            nt.t = resolve_ty(C, v->payload.at[j].ty);
+            vec_push(C->a, &vi.payload, nt);
+        }
+        vec_push(C->a, &ei->variants, vi);
+    }
+
+    C->active_subst.len = mark;
+
+    item it;
+    memset(&it, 0, sizeof it);
+    it.kind = IT_ENUM;
+    it.as.en = clone;
+    vec_push(C->a, &C->current_prog->items, it);
+
+    return mangled;
+}
+
+static const char *instantiate_interface(checker *C, const char *qbase, interface_decl *tmpl,
+                                          ty_vec args, span at) {
+    const char *mangled = intern_z(C->in, mangle(C->a, qbase, args));
+    if (map_has(&C->instantiated, mangled)) return mangled;
+    map_put(&C->instantiated, mangled, (void *)1);
+
+    if (tmpl->generics.len != args.len) {
+        cerr(C, at, arena_printf(C->a, "`%s` takes %d type argument(s), found %d",
+                                  qbase, tmpl->generics.len, args.len));
+        return mangled;
+    }
+
+    interface_decl *clone = NEW(C->a, interface_decl);
+    *clone = *tmpl;
+    clone->name = mangled;
+    memset(&clone->generics, 0, sizeof clone->generics);
+
+    interface_info *ii = NEW(C->a, interface_info);
+    ii->at = at;
+    map_put(&C->d->interfaces, mangled, ii);
+
+    int mark = C->active_subst.len;
+    for (int i = 0; i < tmpl->generics.len; i++) {
+        named_ty nt;
+        nt.name = tmpl->generics.at[i].name;
+        nt.t = args.at[i];
+        vec_push(C->a, &C->active_subst, nt);
+    }
+
+    for (int k = 0; k < clone->methods.len; k++)
+        vec_push(C->a, &ii->methods, sig_of(C, clone->methods.at[k]));
+
+    C->active_subst.len = mark;
+
+    item it;
+    memset(&it, 0, sizeof it);
+    it.kind = IT_INTERFACE;
+    it.as.iface = clone;
+    vec_push(C->a, &C->current_prog->items, it);
+
+    return mangled;
+}
+
+static void resolve_implements(checker *C, struct_info *si, iface_ref_vec *refs) {
+    for (int k = 0; k < refs->len; k++) {
+        iface_ref *r = &refs->at[k];
+        implemented im;
+        im.at = r->at;
+        if (r->args.len == 0) {
+            im.name = path_text(C->a, &r->p);
+        } else {
+            const char *base = path_text(C->a, &r->p);
+            const char *q = qualify(C, base);
+            interface_decl *itmpl = q ? (interface_decl *)map_get(&C->iface_tmpls, q) : NULL;
+            if (!itmpl) {
+                cerr(C, r->at, arena_printf(C->a, "`%s` is not a generic interface", base));
+                continue;
+            }
+            ty_vec resolved;
+            memset(&resolved, 0, sizeof resolved);
+            for (int a = 0; a < r->args.len; a++)
+                vec_push(C->a, &resolved, resolve_ty(C, r->args.at[a]));
+            im.name = instantiate_interface(C, q, itmpl, resolved, r->at);
+        }
+        vec_push(C->a, &si->implements, im);
+    }
+}
+
 static void collect_names(checker *C, program *p) {
     for (int i = 0; i < p->items.len; i++) {
         item *it = &p->items.at[i];
         switch (it->kind) {
             case IT_STRUCT: {
                 const char *qn = qualify(C, it->as.st->name);
+                if (it->as.st->generics.len > 0) {
+                    map_put(&C->struct_tmpls, intern_z(C->in, qn), it->as.st);
+                    break;
+                }
                 if (map_has(&C->d->structs, qn) || map_has(&C->d->enums, qn))
                     cerr(C, it->as.st->at,
                          arena_printf(C->a, "`%s` is declared more than once", it->as.st->name));
@@ -265,6 +639,10 @@ static void collect_names(checker *C, program *p) {
             }
             case IT_ENUM: {
                 const char *qn = qualify(C, it->as.en->name);
+                if (it->as.en->generics.len > 0) {
+                    map_put(&C->enum_tmpls, intern_z(C->in, qn), it->as.en);
+                    break;
+                }
                 if (map_has(&C->d->structs, qn) || map_has(&C->d->enums, qn))
                     cerr(C, it->as.en->at,
                          arena_printf(C->a, "`%s` is declared more than once", it->as.en->name));
@@ -274,10 +652,14 @@ static void collect_names(checker *C, program *p) {
                 break;
             }
             case IT_INTERFACE: {
+                const char *qn = qualify(C, it->as.iface->name);
+                if (it->as.iface->generics.len > 0) {
+                    map_put(&C->iface_tmpls, intern_z(C->in, qn), it->as.iface);
+                    break;
+                }
                 interface_info *ii = NEW(C->a, interface_info);
                 ii->at = it->as.iface->at;
-                map_put(&C->d->interfaces,
-                        intern_z(C->in, qualify(C, it->as.iface->name)), ii);
+                map_put(&C->d->interfaces, intern_z(C->in, qn), ii);
                 break;
             }
             default:
@@ -287,12 +669,15 @@ static void collect_names(checker *C, program *p) {
 }
 
 static void collect_details(checker *C, program *p) {
+    C->current_prog = p;
     for (int i = 0; i < p->items.len; i++) {
         item *it = &p->items.at[i];
         switch (it->kind) {
             case IT_STRUCT: {
                 struct_decl *s = it->as.st;
-                struct_info *si = (struct_info *)map_get(&C->d->structs, qualify(C, s->name));
+                const char *sq = qualify(C, s->name);
+                if (sq && map_has(&C->instantiated, sq)) break;
+                struct_info *si = (struct_info *)map_get(&C->d->structs, sq);
                 if (!si) break;
 
                 for (int k = 0; k < s->fields.len; k++) {
@@ -330,18 +715,15 @@ static void collect_details(checker *C, program *p) {
                     vec_push(C->a, &si->methods, sig);
                 }
 
-                for (int k = 0; k < s->implements.len; k++) {
-                    implemented im;
-                    im.name = path_text(C->a, &s->implements.at[k]);
-                    im.at = s->implements.at[k].at;
-                    vec_push(C->a, &si->implements, im);
-                }
+                resolve_implements(C, si, &s->implements);
                 break;
             }
 
             case IT_ENUM: {
                 enum_decl *e = it->as.en;
-                enum_info *ei = (enum_info *)map_get(&C->d->enums, qualify(C, e->name));
+                const char *eq = qualify(C, e->name);
+                if (eq && map_has(&C->instantiated, eq)) break;
+                enum_info *ei = (enum_info *)map_get(&C->d->enums, eq);
                 if (!ei) break;
                 for (int k = 0; k < e->variants.len; k++) {
                     variant *v = &e->variants.at[k];
@@ -369,9 +751,10 @@ static void collect_details(checker *C, program *p) {
 
             case IT_INTERFACE: {
                 interface_decl *d = it->as.iface;
-                interface_info *ii =
-                    (interface_info *)map_get(&C->d->interfaces, qualify(C, d->name));
-                if (!ii) break;
+                const char *dq = qualify(C, d->name);
+                if (dq && map_has(&C->instantiated, dq)) break;
+                interface_info *ii = (interface_info *)map_get(&C->d->interfaces, dq);
+                if (!ii) break;    // a template; only its instantiations get checked
                 for (int k = 0; k < d->methods.len; k++)
                     vec_push(C->a, &ii->methods, sig_of(C, d->methods.at[k]));
                 break;
@@ -425,7 +808,8 @@ static const char *sig_params_show(checker *C, const fn_sig *sig, bool with_name
 static void check_conformance(checker *C) {
     for (int si = 0; si < C->d->structs.cap; si++) {
         const char *sname = C->d->structs.slots[si].key;
-        if (!sname) continue;
+        if (!sname || map_has(&C->conformance_checked, sname)) continue;
+        map_put(&C->conformance_checked, sname, (void *)1);
         struct_info *s = (struct_info *)C->d->structs.slots[si].val;
 
         for (int k = 0; k < s->implements.len; k++) {
@@ -541,7 +925,8 @@ static void check_cycles(checker *C) {
 
     for (int i = 0; i < C->d->structs.cap; i++) {
         const char *start = C->d->structs.slots[i].key;
-        if (!start) continue;
+        if (!start || map_has(&C->cycles_checked, start)) continue;
+        map_put(&C->cycles_checked, start, (void *)1);
 
         name_vec seen;
         memset(&seen, 0, sizeof seen);
@@ -642,10 +1027,12 @@ static void check_bodies(checker *C, program *p) {
                 check_func(C, it->as.fn, NULL);
                 break;
             case IT_STRUCT:
+                if (it->as.st->generics.len > 0) break;    // template, not a real type
                 for (int k = 0; k < it->as.st->methods.len; k++)
                     check_func(C, it->as.st->methods.at[k], it->as.st->name);
                 break;
             case IT_INTERFACE:
+                if (it->as.iface->generics.len > 0) break;
                 for (int k = 0; k < it->as.iface->methods.len; k++)
                     if (it->as.iface->methods.at[k]->body)
                         check_func(C, it->as.iface->methods.at[k], NULL);
@@ -718,19 +1105,21 @@ static void check_pattern(checker *C, pattern *pat, ty *sty,
                 return;
             }
 
+            const char *enq = qualify(C, en);
+            if (!enq) enq = en;
+
             if (enum_name) {
-                const char *q = qualify(C, en);
-                if (!q) q = en;
-                if (strcmp(q, enum_name) != 0) {
+                size_t qn = strlen(enq);
+                bool is_instance_of = strncmp(enq, enum_name, qn) == 0 && enum_name[qn] == '[';
+                if (strcmp(enq, enum_name) != 0 && !is_instance_of) {
                     cerr(C, pat->at,
                          arena_printf(C->a, "pattern is `%s` but the switch is over `%s`",
                                       en, enum_name));
                     return;
                 }
+                enq = enum_name;
             }
 
-            const char *enq = qualify(C, en);
-            if (!enq) enq = en;
             enum_info *info = (enum_info *)map_get(&C->d->enums, enq);
             if (!info) {
                 cerr(C, pat->at, arena_printf(C->a, "cannot find enum `%s`", en));
@@ -829,11 +1218,18 @@ static void check_block(checker *C, block *b) {
 static void check_stmt(checker *C, stmt *s) {
     switch (s->kind) {
         case ST_LET: {
-            ty *got = check_expr(C, s->as.let_.value);
+            expr *val = s->as.let_.value;
+            // Generic literals infer their type args from the declared type.
+            bool needs_hint = val->kind == EX_STRUCT_LIT ||
+                (val->kind == EX_CALL && val->as.call.callee->kind == EX_FIELD);
+            ty *want = (needs_hint && s->as.let_.ty) ? resolve_ty(C, s->as.let_.ty) : NULL;
+            if (want) val->hint = want;
+
+            ty *got = check_expr(C, val);
             ty *final_ty;
             if (s->as.let_.ty) {
-                ty *want = resolve_ty(C, s->as.let_.ty);
-                got = adopt_empty_array(s->as.let_.value, got, want);
+                if (!want) want = resolve_ty(C, s->as.let_.ty);
+                got = adopt_empty_literal(s->as.let_.value, got, want);
                 if (!ty_assignable(got, want))
                     cerr(C, s->as.let_.value->at,
                          arena_printf(C->a, "expected `%s`, found `%s`",
@@ -884,7 +1280,7 @@ static void check_stmt(checker *C, stmt *s) {
                      arena_printf(C->a,
                                   "compound assignment needs a numeric type, found `%s`",
                                   ty_show(C->a, target)));
-            } else if (!ty_assignable(adopt_empty_array(s->as.assign.value, got, target),
+            } else if (!ty_assignable(adopt_empty_literal(s->as.assign.value, got, target),
                                       target)) {
                 cerr(C, s->as.assign.value->at,
                      arena_printf(C->a, "expected `%s`, found `%s`",
@@ -937,7 +1333,7 @@ static void check_stmt(checker *C, stmt *s) {
 
         case ST_RETURN: {
             ty *got = s->as.value ? check_expr(C, s->as.value) : ty_void();
-            got = adopt_empty_array(s->as.value, got, C->ret_ty);
+            got = adopt_empty_literal(s->as.value, got, C->ret_ty);
             if (!ty_assignable(got, C->ret_ty)) {
                 span at = s->as.value ? s->as.value->at : s->at;
                 cerr(C, at, arena_printf(C->a, "expected `%s`, found `%s`",
@@ -959,6 +1355,8 @@ static void check_stmt(checker *C, stmt *s) {
 // Signatures for the functions the runtime provides. `TK_ERROR` in a parameter
 // slot means "accepts anything", which is how the few polymorphic builtins are
 // typed without a full generics system.
+// `sqrt`/`abs` duplicate std/math.sl's own extern decls of the same name;
+// known wart, not untangled here.
 static ty *builtin_sig(checker *C, const char *name) {
     ty_vec ps;
     memset(&ps, 0, sizeof ps);
@@ -982,6 +1380,48 @@ static ty *builtin_sig(checker *C, const char *name) {
         vec_push(C->a, &ps, ty_error());
         vec_push(C->a, &ps, ty_error());
         return ty_func(C->a, ps, ty_void());
+    }
+    if (strcmp(name, "pop") == 0) {
+        vec_push(C->a, &ps, ty_error());
+        return ty_func(C->a, ps, ty_error());
+    }
+    if (strcmp(name, "reverse") == 0) {
+        vec_push(C->a, &ps, ty_error());
+        return ty_func(C->a, ps, ty_void());
+    }
+    if (strcmp(name, "indexOf") == 0) {
+        vec_push(C->a, &ps, ty_error());
+        vec_push(C->a, &ps, ty_error());
+        return ty_func(C->a, ps, ty_int());
+    }
+    if (strcmp(name, "contains") == 0) {
+        vec_push(C->a, &ps, ty_error());
+        vec_push(C->a, &ps, ty_error());
+        return ty_func(C->a, ps, ty_bool());
+    }
+    if (strcmp(name, "removeAt") == 0) {
+        vec_push(C->a, &ps, ty_error());
+        vec_push(C->a, &ps, ty_int());
+        return ty_func(C->a, ps, ty_error());
+    }
+    if (strcmp(name, "insertAt") == 0) {
+        vec_push(C->a, &ps, ty_error());
+        vec_push(C->a, &ps, ty_int());
+        vec_push(C->a, &ps, ty_error());
+        return ty_func(C->a, ps, ty_void());
+    }
+    if (strcmp(name, "sort") == 0) {
+        vec_push(C->a, &ps, ty_error());
+        return ty_func(C->a, ps, ty_void());
+    }
+    if (strcmp(name, "removeKey") == 0) {
+        vec_push(C->a, &ps, ty_error());
+        vec_push(C->a, &ps, ty_error());
+        return ty_func(C->a, ps, ty_error());
+    }
+    if (strcmp(name, "keys") == 0 || strcmp(name, "values") == 0) {
+        vec_push(C->a, &ps, ty_error());
+        return ty_func(C->a, ps, ty_array(C->a, ty_error()));
     }
     return NULL;
 }
@@ -1069,9 +1509,8 @@ static ty *check_path(checker *C, path *p, span at) {
         binding_entry *b = lookup(C, n);
         if (b) return b->t;
 
-        ty *bi = builtin_sig(C, n);
-        if (bi) return bi;
-
+        // A module's own declaration wins over a global builtin of the same
+        // name (e.g. strings.sl's own `indexOf` over the array builtin).
         const char *q = qualify(C, n);
         if (q) {
             ty *cst = (ty *)map_get(&C->d->consts, q);
@@ -1079,6 +1518,10 @@ static ty *check_path(checker *C, path *p, span at) {
             fn_sig *sig = (fn_sig *)map_get(&C->d->funcs, q);
             if (sig) return sig_as_func_ty(C, sig);
         }
+
+        ty *bi = builtin_sig(C, n);
+        if (bi) return bi;
+
         // Nothing by that name here, so try the prelude. A host declares its
         // externs once there and no script has to repeat them; a name defined
         // locally still wins, so a prelude cannot capture one.
@@ -1230,6 +1673,20 @@ static ty *check_struct_lit(checker *C, expr *e) {
     if (!name) name = written;
 
     struct_info *si = (struct_info *)map_get(&C->d->structs, name);
+    if (!si && map_has(&C->struct_tmpls, name)) {
+        if (e->hint && e->hint->kind == TK_NAMED) {
+            name = e->hint->name;
+            si = (struct_info *)map_get(&C->d->structs, name);
+        }
+        if (!si) {
+            cerr_help(C, e->at,
+                      arena_printf(C->a, "annotate the binding, e.g. `let x: %s[..] = %s { .. };`",
+                                   written, written),
+                      arena_printf(C->a, "can't infer type argument(s) for `%s`", written));
+            for (int i = 0; i < fields->len; i++) check_expr(C, fields->at[i].value);
+            return ty_error();
+        }
+    }
     if (!si) {
         // `Enum.Variant { .. }` is not a thing; variants use call syntax.
         if (map_has(&C->d->enums, name)) {
@@ -1248,7 +1705,7 @@ static ty *check_struct_lit(checker *C, expr *e) {
         for (int k = 0; k < si->fields.len; k++)
             if (strcmp(si->fields.at[k].name, fields->at[i].name) == 0) fi = &si->fields.at[k];
         if (fi) {
-            vt = adopt_empty_array(fields->at[i].value, vt, fi->t);
+            vt = adopt_empty_literal(fields->at[i].value, vt, fi->t);
             if (!ty_assignable(vt, fi->t))
                 cerr(C, fields->at[i].value->at,
                      arena_printf(C->a, "field `%s` expects `%s`, found `%s`",
@@ -1291,6 +1748,59 @@ static ty *check_call(checker *C, expr *e) {
         return ty_void();
     }
 
+    // Generic function, bare or qualified: `identity(x)`, `mod.identity(x)`.
+    {
+        const char *chain = static_path(C->a, callee);
+        const char *q = chain ? qualify(C, chain) : NULL;
+        fn_sig *sig = q ? (fn_sig *)map_get(&C->d->funcs, q) : NULL;
+        if (sig && sig->generics.len > 0) return check_generic_call(C, e, sig, args);
+    }
+
+    // Generic enum variant, e.g. `Option.Some(x)` or `opt.Option.Some(x)`.
+    if (callee->kind == EX_FIELD && !callee->as.field.optional &&
+        static_path(C->a, callee->as.field.base)) {
+        const char *head = static_path(C->a, callee->as.field.base);
+        const char *q = qualify(C, head);
+        if (q && !map_has(&C->d->enums, q) && map_has(&C->enum_tmpls, q)) {
+            if (!e->hint || e->hint->kind != TK_NAMED) {
+                cerr_help(C, e->at,
+                          arena_printf(C->a, "annotate the binding, e.g. `let x: %s[..] = ..;`",
+                                       head),
+                          arena_printf(C->a, "can't infer type argument(s) for `%s`", head));
+                for (int i = 0; i < args->len; i++) check_expr(C, args->at[i]);
+                return ty_error();
+            }
+            const char *mangled = e->hint->name;
+            enum_info *ei = (enum_info *)map_get(&C->d->enums, mangled);
+            const char *vname = callee->as.field.name;
+            variant_info *vi = NULL;
+            if (ei)
+                for (int i = 0; i < ei->variants.len; i++)
+                    if (strcmp(ei->variants.at[i].name, vname) == 0) vi = &ei->variants.at[i];
+            if (!vi) {
+                cerr(C, callee->at,
+                     arena_printf(C->a, "`%s` has no variant `%s`", mangled, vname));
+                for (int i = 0; i < args->len; i++) check_expr(C, args->at[i]);
+                return ty_error();
+            }
+            if (args->len != vi->payload.len)
+                cerr(C, e->at,
+                     arena_printf(C->a, "this variant takes %d argument(s) but %d were supplied",
+                                  vi->payload.len, args->len));
+            for (int i = 0; i < args->len; i++) {
+                ty *got = check_expr(C, args->at[i]);
+                if (i < vi->payload.len) {
+                    got = adopt_empty_literal(args->at[i], got, vi->payload.at[i].t);
+                    if (!ty_assignable(got, vi->payload.at[i].t))
+                        cerr(C, args->at[i]->at,
+                             arena_printf(C->a, "expected `%s`, found `%s`",
+                                          ty_show(C->a, vi->payload.at[i].t), ty_show(C->a, got)));
+                }
+            }
+            return ty_named(C->a, intern_z(C->in, mangled));
+        }
+    }
+
     // A bound-method call carries its receiver implicitly, so just type the
     // callee and use its function type.
     ty *cty = check_expr(C, callee);
@@ -1313,7 +1823,7 @@ static ty *check_call(checker *C, expr *e) {
     for (int i = 0; i < args->len; i++) {
         ty *got = check_expr(C, args->at[i]);
         if (i < cty->params.len)
-            got = adopt_empty_array(args->at[i], got, cty->params.at[i]);
+            got = adopt_empty_literal(args->at[i], got, cty->params.at[i]);
         if (i < cty->params.len && !ty_assignable(got, cty->params.at[i])) {
             cerr(C, args->at[i]->at,
                  arena_printf(C->a, "expected `%s`, found `%s`",
@@ -1483,6 +1993,31 @@ static ty *check_expr(checker *C, expr *e) {
             return ty_error();
         }
 
+        case EX_SLICE: {
+            ty *b = check_expr(C, e->as.slice.base);
+            if (e->as.slice.lo) {
+                ty *lo = check_expr(C, e->as.slice.lo);
+                if (!ty_assignable(lo, ty_int()))
+                    cerr(C, e->as.slice.lo->at,
+                         arena_printf(C->a, "slice bound must be `int`, found `%s`",
+                                      ty_show(C->a, lo)));
+            }
+            if (e->as.slice.hi) {
+                ty *hi = check_expr(C, e->as.slice.hi);
+                if (!ty_assignable(hi, ty_int()))
+                    cerr(C, e->as.slice.hi->at,
+                         arena_printf(C->a, "slice bound must be `int`, found `%s`",
+                                      ty_show(C->a, hi)));
+            }
+            if (b->kind == TK_ERROR) return ty_error();
+            if (b->kind != TK_ARRAY) {
+                cerr(C, e->as.slice.base->at,
+                     arena_printf(C->a, "`%s` cannot be sliced", ty_show(C->a, b)));
+                return ty_error();
+            }
+            return b;
+        }
+
         case EX_FIELD: {
             // `Enum.Variant` and `Type.staticMethod` look identical to field
             // access after parsing, so try the type interpretation first, but
@@ -1539,6 +2074,12 @@ decls *check_modules(arena *a, sl_interner *in, loaded *l, diag_vec *diags) {
     C.ret_ty = ty_void();
     C.current_module = "";
     C.prelude = l->prelude;
+    map_init(&C.struct_tmpls, a);
+    map_init(&C.enum_tmpls, a);
+    map_init(&C.iface_tmpls, a);
+    map_init(&C.conformance_checked, a);
+    map_init(&C.cycles_checked, a);
+    map_init(&C.instantiated, a);
     push_scope(&C);
 
     // Two passes over every module: all type names first, then all details.
@@ -1564,6 +2105,10 @@ decls *check_modules(arena *a, sl_interner *in, loaded *l, diag_vec *diags) {
         enter_module(&C, l->modules.at[i]);
         check_bodies(&C, l->modules.at[i]->prog);
     }
+
+    // Catches body-only instantiations the first pass missed.
+    check_conformance(&C);
+    check_cycles(&C);
 
     return d;
 }

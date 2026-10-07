@@ -11,9 +11,8 @@ static const char src_math[] =
     "// The `extern` declarations are backed by native code, and everything else is\n"
     "// ordinary Solis.\n"
     "//\n"
-    "// Note there is no overloading and no generics, so int and float versions are\n"
-    "// separate functions. `maxf` is the float twin of `max`. That is the honest\n"
-    "// cost of the trim, and it is better than pretending.\n"
+    "// Note there is no overloading, so int and float versions are separate\n"
+    "// functions regardless of generics. `maxf` is the float twin of `max`.\n"
     "\n"
     "// Solis never converts between int and float implicitly, so these are the only\n"
     "// way across. You will reach for `toFloat` constantly when averaging.\n"
@@ -102,7 +101,16 @@ static const char src_math[] =
     "func radians(degrees: float): float {\n"
     "    return degrees * PI / 180.0;\n"
     "}\n"
-    "\n";
+    "\n"
+    "func range(start: int, end: int): [int] {\n"
+    "    var out: [int] = [];\n"
+    "    var i = 0;\n"
+    "    while i < end - start {\n"
+    "        push(out, i + start);\n"
+    "        i = i + 1;\n"
+    "    }\n"
+    "    return out;\n"
+    "}\n";
 
 static const char src_strings[] =
     "// The `strings` module.\n"
@@ -360,14 +368,8 @@ static const char src_os[] =
     "// The script's own arguments, without the script path. Index 0 is the first\n"
     "// real argument, which is what a script usually wants.\n"
     "func argv(): [str] {\n"
-    "    var out: [str] = [];\n"
     "    let all = args();\n"
-    "    var i = 1;\n"
-    "    while i < len(all) {\n"
-    "        push(out, all[i]);\n"
-    "        i += 1;\n"
-    "    }\n"
-    "    return out;\n"
+    "    return all[1:];\n"
     "}\n"
     "\n"
     "// The i'th script argument, or `fallback` if it was not given.\n"
@@ -459,5 +461,49 @@ static const char src_rand[] =
     "        return 0 - 1;\n"
     "    }\n"
     "    return below(count);\n"
+    "}\n"
+    "\n";
+
+static const char src_option[] =
+    "// No isSome/unwrap/etc: enums can't have methods, and a generic function\n"
+    "// can't yet take an already-generic type like `Option[T]` as a parameter.\n"
+    "// Use `switch` to unwrap.\n"
+    "\n"
+    "enum Option[T] {\n"
+    "    Some(value: T),\n"
+    "    None,\n"
+    "}\n"
+    "\n";
+
+static const char src_result[] =
+    "// Same limitation as option.sl: no convenience functions, use `switch`.\n"
+    "\n"
+    "enum Result[Ok, Err] {\n"
+    "    Success(value: Ok),\n"
+    "    Failure(error: Err),\n"
+    "}\n"
+    "\n";
+
+static const char src_test[] =
+    "func assert(cond: bool, msg: str) {\n"
+    "    if !cond {\n"
+    "        print(\"FAIL: ${msg}\");\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "func assertEqual[T](got: T, want: T, msg: str) {\n"
+    "    if got != want {\n"
+    "        print(\"FAIL: ${msg}\");\n"
+    "    }\n"
+    "}\n"
+    "\n";
+
+static const char src_map[] =
+    "// Overlays `b` onto `a` in place (`b`'s keys win on conflict) and returns `a`.\n"
+    "func merge[K, V](a: {K: V}, b: {K: V}): {K: V} {\n"
+    "    for k in keys(b) {\n"
+    "        a[k] = b[k];\n"
+    "    }\n"
+    "    return a;\n"
     "}\n"
     "\n";

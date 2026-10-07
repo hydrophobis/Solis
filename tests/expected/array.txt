@@ -1,0 +1,7 @@
+contains 4 = true
+indexOf 1 = 2
+sorted = [1, 2, 3, 4, 5]
+reversed = [5, 4, 3, 2, 1]
+popped = 1, now = [5, 4, 3, 2]
+after removeAt(0) = [4, 3, 2]
+after insertAt(1, 99) = [4, 99, 3, 2]

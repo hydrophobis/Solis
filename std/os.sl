@@ -30,14 +30,8 @@ extern func run(command: str): int;
 // The script's own arguments, without the script path. Index 0 is the first
 // real argument, which is what a script usually wants.
 func argv(): [str] {
-    var out: [str] = [];
     let all = args();
-    var i = 1;
-    while i < len(all) {
-        push(out, all[i]);
-        i += 1;
-    }
-    return out;
+    return all[1:];
 }
 
 // The i'th script argument, or `fallback` if it was not given.

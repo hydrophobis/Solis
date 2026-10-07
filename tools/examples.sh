@@ -7,7 +7,14 @@ EXAMPLES=(
     examples/hello.sl
     examples/conform.sl
     examples/unicode.sl
+    examples/array.sl
     examples/bench.sl
+    examples/generics.sl
+    examples/generic_funcs.sl
+    examples/map_demo.sl
+    examples/option_result.sl
+    examples/slices.sl
+    examples/test_demo.sl
     examples/stdlib.sl
     examples/host.sl
     examples/native.sl

@@ -1,0 +1,7 @@
+m[a] = 1
+len after set = 3
+has c = true
+has z = false
+m[a] after += 10 = 11
+removed b = 2, len now = 2
+merged = {a: 11, c: 300, d: 4}

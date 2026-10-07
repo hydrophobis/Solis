@@ -1,0 +1,5 @@
+stack empty = false
+got hi
+err: bad input
+has score 1 = true
+bag has 9 = true

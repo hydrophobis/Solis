@@ -45,7 +45,9 @@ enum {
 
     OP_NULL = 142,
 
-    OP_INCR_I = 150, OP_MOVE = 151, OP_ADD_RR_I = 152
+    OP_INCR_I = 150, OP_MOVE = 151, OP_ADD_RR_I = 152,
+    OP_SLICE = 153,
+    OP_NEW_MAP = 154, OP_MGET = 155, OP_MSET = 156
 };
 
 typedef struct {
@@ -73,6 +75,15 @@ typedef struct {
     uint16_t n;
     sl_value payload[1];
 } sl_variant;
+
+typedef struct { sl_value key, val; } map_pair;
+
+typedef struct {
+    sl_obj    head;
+    int64_t   len;
+    int64_t   cap;
+    map_pair *pairs;
+} sl_map_obj;
 
 typedef enum { C_INT, C_FLOAT, C_STR } const_type;
 
@@ -163,6 +174,15 @@ void sl_release(sl_vm *vm, sl_value v) {
             for (uint16_t i = 0; i < t->n; i++) sl_release(vm, t->payload[i]);
             break;
         }
+        case SL_MAP: {
+            sl_map_obj *m = (sl_map_obj *)o;
+            for (int64_t i = 0; i < m->len; i++) {
+                sl_release(vm, m->pairs[i].key);
+                sl_release(vm, m->pairs[i].val);
+            }
+            free(m->pairs);
+            break;
+        }
     }
     vm->live--;
     free(o);
@@ -232,6 +252,156 @@ sl_value sl_array_get(sl_value v, int64_t i) {
     sl_arr *a = (sl_arr *)v.as.o;
     if (!a || i < 0 || i >= a->len) return sl_void();
     return a->items[i];
+}
+
+bool sl_array_set(sl_vm *vm, sl_value arr, int64_t i, sl_value item) {
+    if (arr.type != SL_OBJ || !arr.as.o || arr.as.o->kind != SL_ARRAY) {
+        sl_release(vm, item);
+        vm_error(vm, "not an array");
+        return false;
+    }
+    sl_arr *a = (sl_arr *)arr.as.o;
+    if (i < 0 || i >= a->len) {
+        sl_release(vm, item);
+        vm_error(vm, "index %lld is out of bounds for an array of length %lld",
+                 (long long)i, (long long)a->len);
+        return false;
+    }
+    sl_release(vm, a->items[i]);
+    a->items[i] = item;
+    return true;
+}
+
+bool sl_array_pop(sl_vm *vm, sl_value arr, sl_value *out) {
+    if (arr.type != SL_OBJ || !arr.as.o || arr.as.o->kind != SL_ARRAY) {
+        vm_error(vm, "not an array");
+        return false;
+    }
+    sl_arr *a = (sl_arr *)arr.as.o;
+    if (a->len == 0) {
+        vm_error(vm, "pop on an empty array");
+        return false;
+    }
+    *out = a->items[--a->len];
+    return true;
+}
+
+bool sl_array_remove(sl_vm *vm, sl_value arr, int64_t i, sl_value *out) {
+    if (arr.type != SL_OBJ || !arr.as.o || arr.as.o->kind != SL_ARRAY) {
+        vm_error(vm, "not an array");
+        return false;
+    }
+    sl_arr *a = (sl_arr *)arr.as.o;
+    if (i < 0 || i >= a->len) {
+        vm_error(vm, "index %lld is out of bounds for an array of length %lld",
+                 (long long)i, (long long)a->len);
+        return false;
+    }
+    *out = a->items[i];
+    for (int64_t k = i; k < a->len - 1; k++) a->items[k] = a->items[k + 1];
+    a->len--;
+    return true;
+}
+
+bool sl_array_insert(sl_vm *vm, sl_value arr, int64_t i, sl_value item) {
+    if (arr.type != SL_OBJ || !arr.as.o || arr.as.o->kind != SL_ARRAY) {
+        sl_release(vm, item);
+        vm_error(vm, "not an array");
+        return false;
+    }
+    sl_arr *a = (sl_arr *)arr.as.o;
+    if (i < 0 || i > a->len) {
+        sl_release(vm, item);
+        vm_error(vm, "index %lld is out of bounds for an array of length %lld",
+                 (long long)i, (long long)a->len);
+        return false;
+    }
+    if (!array_push(vm, a, sl_void())) return false;
+    for (int64_t k = a->len - 1; k > i; k--) a->items[k] = a->items[k - 1];
+    a->items[i] = item;
+    return true;
+}
+
+static bool sl_value_eq(sl_value a, sl_value b);
+
+sl_value sl_map(sl_vm *vm, int64_t cap) {
+    sl_map_obj *m = (sl_map_obj *)malloc(sizeof(sl_map_obj));
+    if (!m) { vm_error(vm, "out of memory"); return sl_void(); }
+    m->head.rc = 1;
+    m->head.kind = SL_MAP;
+    m->len = 0;
+    m->cap = cap > 0 ? cap : 0;
+    m->pairs = m->cap ? (map_pair *)malloc(sizeof(map_pair) * (size_t)m->cap) : NULL;
+    if (m->cap && !m->pairs) { free(m); vm_error(vm, "out of memory"); return sl_void(); }
+    vm->live++;
+    return obj_value(&m->head);
+}
+
+int64_t sl_map_len(sl_value v) {
+    if (v.type != SL_OBJ || !v.as.o || v.as.o->kind != SL_MAP) return 0;
+    return ((sl_map_obj *)v.as.o)->len;
+}
+
+bool sl_map_get(sl_value m, sl_value key, sl_value *out) {
+    if (m.type != SL_OBJ || !m.as.o || m.as.o->kind != SL_MAP) return false;
+    sl_map_obj *mo = (sl_map_obj *)m.as.o;
+    for (int64_t i = 0; i < mo->len; i++) {
+        if (!sl_value_eq(mo->pairs[i].key, key)) continue;
+        *out = mo->pairs[i].val;
+        return true;
+    }
+    return false;
+}
+
+bool sl_map_set(sl_vm *vm, sl_value m, sl_value key, sl_value val) {
+    if (m.type != SL_OBJ || !m.as.o || m.as.o->kind != SL_MAP) {
+        sl_release(vm, key);
+        sl_release(vm, val);
+        vm_error(vm, "not a map");
+        return false;
+    }
+    sl_map_obj *mo = (sl_map_obj *)m.as.o;
+    for (int64_t i = 0; i < mo->len; i++) {
+        if (!sl_value_eq(mo->pairs[i].key, key)) continue;
+        sl_release(vm, mo->pairs[i].val);
+        mo->pairs[i].val = val;
+        sl_release(vm, key);   // an equal key is already stored; this one is spare
+        return true;
+    }
+    if (mo->len == mo->cap) {
+        int64_t cap = mo->cap < 8 ? 8 : mo->cap * 2;
+        map_pair *n = (map_pair *)realloc(mo->pairs, sizeof(map_pair) * (size_t)cap);
+        if (!n) { sl_release(vm, key); sl_release(vm, val); vm_error(vm, "out of memory"); return false; }
+        mo->pairs = n;
+        mo->cap = cap;
+    }
+    mo->pairs[mo->len].key = key;
+    mo->pairs[mo->len].val = val;
+    mo->len++;
+    return true;
+}
+
+bool sl_map_remove(sl_vm *vm, sl_value m, sl_value key, sl_value *out) {
+    if (m.type != SL_OBJ || !m.as.o || m.as.o->kind != SL_MAP) return false;
+    sl_map_obj *mo = (sl_map_obj *)m.as.o;
+    for (int64_t i = 0; i < mo->len; i++) {
+        if (!sl_value_eq(mo->pairs[i].key, key)) continue;
+        *out = mo->pairs[i].val;
+        sl_release(vm, mo->pairs[i].key);
+        for (int64_t k = i; k < mo->len - 1; k++) mo->pairs[k] = mo->pairs[k + 1];
+        mo->len--;
+        return true;
+    }
+    return false;
+}
+
+bool sl_map_pair_at(sl_value m, int64_t i, sl_value *key_out, sl_value *val_out) {
+    if (m.type != SL_OBJ || !m.as.o || m.as.o->kind != SL_MAP) return false;
+    sl_map_obj *mo = (sl_map_obj *)m.as.o;
+    if (i < 0 || i >= mo->len) return false;
+    *key_out = mo->pairs[i].key;
+    *val_out = mo->pairs[i].val;
+    return true;
 }
 
 // Takes ownership of `item`.
@@ -354,6 +524,18 @@ static void render(sl_vm *vm, sl_value v, char **buf, size_t *len, size_t *cap) 
             }
             return;
         }
+        case SL_MAP: {
+            sl_map_obj *m = (sl_map_obj *)v.as.o;
+            append(buf, len, cap, "{", 1);
+            for (int64_t i = 0; i < m->len; i++) {
+                if (i) append(buf, len, cap, ", ", 2);
+                render(vm, m->pairs[i].key, buf, len, cap);
+                append(buf, len, cap, ": ", 2);
+                render(vm, m->pairs[i].val, buf, len, cap);
+            }
+            append(buf, len, cap, "}", 1);
+            return;
+        }
     }
 }
 
@@ -422,12 +604,201 @@ static sl_value intrin_abs(sl_vm *vm, int argc, sl_value *argv) {
     return sl_int(i < 0 ? -i : i);
 }
 
+static bool want_array_arg(sl_vm *vm, sl_value v, const char *who) {
+    if (v.type != SL_OBJ || !v.as.o || v.as.o->kind != SL_ARRAY) {
+        sl_fail(vm, who);
+        return false;
+    }
+    return true;
+}
+
+static bool sl_value_eq(sl_value a, sl_value b) {
+    if (a.type != b.type) return false;
+    switch (a.type) {
+        case SL_INT: return a.as.i == b.as.i;
+        case SL_FLOAT: return a.as.f == b.as.f;
+        case SL_BOOL: return a.as.b == b.as.b;
+        case SL_OBJ: {
+            if (!a.as.o || !b.as.o) return a.as.o == b.as.o;
+            if (a.as.o->kind != SL_STR || b.as.o->kind != SL_STR) return false;
+            size_t an, bn;
+            const char *ap = sl_as_str(a, &an), *bp = sl_as_str(b, &bn);
+            return an == bn && memcmp(ap, bp, an) == 0;
+        }
+        default: return false;
+    }
+}
+
+// `==`/`!=` on a bare generic type param: the compiler doesn't know which
+// typed opcode to pick at that call site, so it calls this instead, which
+// decides from the values' own runtime tags. Unspellable name: not reachable
+// except from codegen's own emission.
+static sl_value intrin_eq_any(sl_vm *vm, int argc, sl_value *argv) {
+    (void)vm;
+    if (argc < 2) return sl_bool(false);
+    return sl_bool(sl_value_eq(argv[0], argv[1]));
+}
+
+static sl_value intrin_pop(sl_vm *vm, int argc, sl_value *argv) {
+    if (argc < 1 || !want_array_arg(vm, argv[0], "pop expects an array")) return sl_void();
+    sl_value out;
+    if (!sl_array_pop(vm, argv[0], &out)) return sl_void();
+    return out;
+}
+
+static sl_value intrin_index_of(sl_vm *vm, int argc, sl_value *argv) {
+    if (argc < 2 || !want_array_arg(vm, argv[0], "indexOf expects an array")) return sl_void();
+    int64_t n = sl_array_len(argv[0]);
+    for (int64_t i = 0; i < n; i++)
+        if (sl_value_eq(sl_array_get(argv[0], i), argv[1])) return sl_int(i);
+    return sl_int(-1);
+}
+
+static sl_value intrin_contains(sl_vm *vm, int argc, sl_value *argv) {
+    if (argc < 2) { sl_fail(vm, "contains expects an array or a map"); return sl_void(); }
+    if (argv[0].type == SL_OBJ && argv[0].as.o && argv[0].as.o->kind == SL_MAP) {
+        sl_value unused;
+        return sl_bool(sl_map_get(argv[0], argv[1], &unused));
+    }
+    if (!want_array_arg(vm, argv[0], "contains expects an array or a map")) return sl_void();
+    int64_t n = sl_array_len(argv[0]);
+    for (int64_t i = 0; i < n; i++)
+        if (sl_value_eq(sl_array_get(argv[0], i), argv[1])) return sl_bool(true);
+    return sl_bool(false);
+}
+
+static sl_value intrin_remove_key(sl_vm *vm, int argc, sl_value *argv) {
+    if (argc < 2) { sl_fail(vm, "removeKey expects a map and a key"); return sl_void(); }
+    sl_value out;
+    if (!sl_map_remove(vm, argv[0], argv[1], &out)) { sl_fail(vm, "key not found"); return sl_void(); }
+    return out;
+}
+
+static sl_value intrin_keys(sl_vm *vm, int argc, sl_value *argv) {
+    if (argc < 1) { sl_fail(vm, "keys expects a map"); return sl_void(); }
+    int64_t n = sl_map_len(argv[0]);
+    sl_value out = sl_array(vm, n);
+    if (vm->failed) return sl_void();
+    for (int64_t i = 0; i < n; i++) {
+        sl_value k, v;
+        sl_map_pair_at(argv[0], i, &k, &v);
+        sl_retain(k);
+        if (!sl_array_push(vm, out, k)) return sl_void();
+    }
+    return out;
+}
+
+static sl_value intrin_values(sl_vm *vm, int argc, sl_value *argv) {
+    if (argc < 1) { sl_fail(vm, "values expects a map"); return sl_void(); }
+    int64_t n = sl_map_len(argv[0]);
+    sl_value out = sl_array(vm, n);
+    if (vm->failed) return sl_void();
+    for (int64_t i = 0; i < n; i++) {
+        sl_value k, v;
+        sl_map_pair_at(argv[0], i, &k, &v);
+        sl_retain(v);
+        if (!sl_array_push(vm, out, v)) return sl_void();
+    }
+    return out;
+}
+
+static sl_value intrin_reverse(sl_vm *vm, int argc, sl_value *argv) {
+    if (argc < 1 || !want_array_arg(vm, argv[0], "reverse expects an array")) return sl_void();
+    int64_t n = sl_array_len(argv[0]);
+    for (int64_t i = 0; i < n / 2; i++) {
+        sl_value a = sl_array_get(argv[0], i);
+        sl_value b = sl_array_get(argv[0], n - 1 - i);
+        sl_retain(a);
+        sl_retain(b);
+        sl_array_set(vm, argv[0], i, b);
+        sl_array_set(vm, argv[0], n - 1 - i, a);
+    }
+    return sl_void();
+}
+
+static sl_value intrin_remove_at(sl_vm *vm, int argc, sl_value *argv) {
+    if (argc < 2 || argv[1].type != SL_INT) {
+        sl_fail(vm, "removeAt expects an array and an index");
+        return sl_void();
+    }
+    sl_value out;
+    if (!sl_array_remove(vm, argv[0], argv[1].as.i, &out)) return sl_void();
+    return out;
+}
+
+static sl_value intrin_insert_at(sl_vm *vm, int argc, sl_value *argv) {
+    if (argc < 3 || argv[1].type != SL_INT) {
+        sl_fail(vm, "insertAt expects an array, an index and a value");
+        return sl_void();
+    }
+    sl_retain(argv[2]);
+    sl_array_insert(vm, argv[0], argv[1].as.i, argv[2]);
+    return sl_void();
+}
+
+// -1/0/1, or `*ok = false` for a pair sort has no defined order for.
+static int value_cmp(sl_value a, sl_value b, bool *ok) {
+    *ok = true;
+    if (a.type != b.type) { *ok = false; return 0; }
+    switch (a.type) {
+        case SL_INT: return a.as.i < b.as.i ? -1 : a.as.i > b.as.i ? 1 : 0;
+        case SL_FLOAT: return a.as.f < b.as.f ? -1 : a.as.f > b.as.f ? 1 : 0;
+        case SL_OBJ: {
+            if (!a.as.o || !b.as.o || a.as.o->kind != SL_STR || b.as.o->kind != SL_STR) {
+                *ok = false;
+                return 0;
+            }
+            size_t an, bn;
+            const char *ap = sl_as_str(a, &an), *bp = sl_as_str(b, &bn);
+            size_t n = an < bn ? an : bn;
+            int c = n ? memcmp(ap, bp, n) : 0;
+            if (c != 0) return c;
+            return an < bn ? -1 : an > bn ? 1 : 0;
+        }
+        default: *ok = false; return 0;
+    }
+}
+
+static sl_value intrin_sort(sl_vm *vm, int argc, sl_value *argv) {
+    if (argc < 1 || !want_array_arg(vm, argv[0], "sort expects an array")) return sl_void();
+    int64_t n = sl_array_len(argv[0]);
+    for (int64_t i = 1; i < n; i++) {
+        int64_t j = i;
+        for (;;) {
+            if (j == 0) break;
+            bool ok;
+            int c = value_cmp(sl_array_get(argv[0], j - 1), sl_array_get(argv[0], j), &ok);
+            if (!ok) { sl_fail(vm, "sort only orders int/float/str elements"); return sl_void(); }
+            if (c <= 0) break;
+            sl_value a = sl_array_get(argv[0], j - 1);
+            sl_value b = sl_array_get(argv[0], j);
+            sl_retain(a);
+            sl_retain(b);
+            sl_array_set(vm, argv[0], j - 1, b);
+            sl_array_set(vm, argv[0], j, a);
+            j--;
+        }
+    }
+    return sl_void();
+}
+
 sl_vm *sl_new(void) {
     sl_vm *vm = (sl_vm *)calloc(1, sizeof(sl_vm));
     if (!vm) return NULL;
     vm->sp = vm->stack;
     sl_register(vm, "sqrt", intrin_sqrt);
     sl_register(vm, "abs", intrin_abs);
+    sl_register(vm, "pop", intrin_pop);
+    sl_register(vm, "indexOf", intrin_index_of);
+    sl_register(vm, "contains", intrin_contains);
+    sl_register(vm, "reverse", intrin_reverse);
+    sl_register(vm, "removeAt", intrin_remove_at);
+    sl_register(vm, "insertAt", intrin_insert_at);
+    sl_register(vm, "sort", intrin_sort);
+    sl_register(vm, " eq", intrin_eq_any);
+    sl_register(vm, "removeKey", intrin_remove_key);
+    sl_register(vm, "keys", intrin_keys);
+    sl_register(vm, "values", intrin_values);
     return vm;
 }
 
@@ -471,8 +842,8 @@ sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
     }
     r.p += 4;
     uint16_t version = rd_u16(&r);
-    if (version != 3) {
-        vm_error(vm, "bytecode version %u, this runtime understands 3", version);
+    if (version != 5) {
+        vm_error(vm, "bytecode version %u, this runtime understands 5", version);
         return SL_ERR_BADFILE;
     }
 
@@ -762,9 +1133,10 @@ sl_result sl_run(sl_vm *vm) {
             }
             sl_arr *a = (sl_arr *)av.as.o;
             int64_t i = iv.as.i;
+            if (i < 0) i += a->len;
             if (i < 0 || i >= a->len) {
                 vm_error(vm, "index %lld is out of bounds for an array of length %lld",
-                         (long long)i, (long long)a->len);
+                         (long long)iv.as.i, (long long)a->len);
                 sl_release(vm, av); goto fail;
             }
             sl_value e = a->items[i];
@@ -782,14 +1154,88 @@ sl_result sl_run(sl_vm *vm) {
             }
             sl_arr *a = (sl_arr *)av.as.o;
             int64_t i = iv.as.i;
+            if (i < 0) i += a->len;
             if (i < 0 || i >= a->len) {
                 vm_error(vm, "index %lld is out of bounds for an array of length %lld",
-                         (long long)i, (long long)a->len);
+                         (long long)iv.as.i, (long long)a->len);
                 sl_release(vm, val); sl_release(vm, av); goto fail;
             }
             sl_release(vm, a->items[i]);
             a->items[i] = val;          // ownership moves into the array
             sl_release(vm, av);
+            break;
+        }
+
+        case OP_SLICE: {
+            sl_value hv = POP(), lv = POP(), av = POP();
+            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) {
+                sl_release(vm, av); vm_error(vm, "not an array"); goto fail;
+            }
+            sl_arr *a = (sl_arr *)av.as.o;
+            int64_t n = a->len;
+            int64_t lo = lv.as.i, hi = hv.as.i;
+            if (lo < 0) lo += n;
+            if (hi < 0) hi += n;
+            if (lo < 0 || hi > n || lo > hi) {
+                vm_error(vm, "slice [%lld:%lld] is out of bounds for an array of length %lld",
+                         (long long)lv.as.i, (long long)hv.as.i, (long long)n);
+                sl_release(vm, av); goto fail;
+            }
+            sl_value out = sl_array(vm, hi - lo);
+            if (vm->failed) { sl_release(vm, av); goto fail; }
+            sl_arr *oa = (sl_arr *)out.as.o;
+            for (int64_t k = lo; k < hi; k++) {
+                sl_value item = a->items[k];
+                sl_retain(item);
+                if (!array_push(vm, oa, item)) {
+                    sl_release(vm, item); sl_release(vm, out); sl_release(vm, av);
+                    goto fail;
+                }
+            }
+            sl_release(vm, av);
+            PUSH(out);
+            break;
+        }
+
+        case OP_NEW_MAP: {
+            uint16_t n = read_u16(&ip);
+            sl_value mv = sl_map(vm, n);
+            if (vm->failed) goto fail;
+            sl_value *base = vm->sp - 2 * n;
+            for (uint16_t i = 0; i < n; i++) {
+                if (!sl_map_set(vm, mv, base[2 * i], base[2 * i + 1])) {
+                    sl_release(vm, mv); goto fail;
+                }
+            }
+            vm->sp = base;
+            PUSH(mv);
+            break;
+        }
+
+        case OP_MGET: {
+            sl_value kv = POP(), mv = POP();
+            if (mv.type != SL_OBJ || !mv.as.o || mv.as.o->kind != SL_MAP) {
+                sl_release(vm, kv); sl_release(vm, mv); vm_error(vm, "not a map"); goto fail;
+            }
+            sl_value out;
+            if (!sl_map_get(mv, kv, &out)) {
+                sl_release(vm, kv); sl_release(vm, mv); vm_error(vm, "key not found"); goto fail;
+            }
+            sl_retain(out);
+            sl_release(vm, kv);
+            sl_release(vm, mv);
+            PUSH(out);
+            break;
+        }
+
+        case OP_MSET: {
+            sl_value val = POP(), kv = POP(), mv = POP();
+            if (mv.type != SL_OBJ || !mv.as.o || mv.as.o->kind != SL_MAP) {
+                sl_release(vm, val); sl_release(vm, kv); sl_release(vm, mv);
+                vm_error(vm, "not a map"); goto fail;
+            }
+            if (!sl_map_set(vm, mv, kv, val)) { sl_release(vm, mv); goto fail; }
+            sl_release(vm, mv);
             break;
         }
 
@@ -801,6 +1247,8 @@ sl_result sl_run(sl_vm *vm) {
                 size_t bn; const char *p = sl_as_str(av, &bn);
                 n = 0;
                 for (size_t k = 0; k < bn; k++) if ((p[k] & 0xC0) != 0x80) n++;
+            } else if (av.type == SL_OBJ && av.as.o && av.as.o->kind == SL_MAP) {
+                n = sl_map_len(av);
             } else {
                 n = sl_array_len(av);
             }
