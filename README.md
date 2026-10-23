@@ -18,25 +18,13 @@ func main() {
     print("length = ${v.length()}");
 }
 ```
-<small>Below content is partly AI generated</small>
 ## Why
 
-Lua owns the embedded-scripting niche, and deservedly. Solis isn't trying to
-dethrone it on vibes. It's betting on a few things Lua is genuinely weak at:
-sandboxing and determinism (fuel metering, no ambient authority, hard memory
-caps, so running untrusted mods is actually safe), no GC pauses (deterministic
-memory behavior for realtime loops), good diagnostics (rendered, Rust/Elm-grade
-error messages instead of a bare line number), and static types from the
-start. Untyped tables make "what fields does this have?" an unsolvable
-question for tooling; static types are what make a debugger and an LSP
-possible later instead of permanently out of reach.
-
-The design rationale, including what got cut and why, is in
-[`docs/design.md`](docs/design.md).
+Lua is an extremely popular pick for environments where you need a scripting language but do not want to do a lot of work to embed something. However, while Lua is a powerful and well designed language, as any language, it is not without its flaws. Most notably, the syntax. Lua chose a very weird and clunky syntax and memory model, which can often constrain how it is used and complicate both setup and usage of a project. Solis aims to fix those problems as well as multiple others. Solis uses a more familiar C-like syntax that should feel much more natural to programmers coming from any C-family language. Solis does not use a garbage collector, but rather opts for semi-automatic memory management, where memory is freed as it is able to be and allocated when it is needed. Another gripe many have with Lua is its typing system (or rather lack thereof), which Solis improves via static typing and a more object-oriented approach. And finally, Solis aims to have very descriptive errors which show and tell the problem, taking a page out of Rust's ideology.
 
 ## Building
 
-You must install [Bloomery](bloomery.toml)():
+You must install [Bloomery](bloomery.toml):
 ```bash
 pip install bloomery-build
 bloomery --list
