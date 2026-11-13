@@ -8,7 +8,7 @@ Solis has two independent pieces.
 
 | Piece | Files | What it does | Needed when |
 |---|---|---|---|
-| Runtime (the VM) | `runtime/solis.c`, `solis_std.c`, `solis_os.c`, header `solis.h` (C++ wrapper `solis.hpp`) | Loads and runs a bytecode image. | Always. |
+| Runtime (the VM) | `runtime/solis.c`, `solis_std.c`, `solis_os.c`, header `solis.h` (C++ wrapper `solis.hpp`) | Loads and runs a bytecode image. `sl_load` translates each function to register code once, so load time is linear in image size. | Always. |
 | Compiler | `compiler/*.c` (not `cli/solis.c`), header `solis_compile.h` (C++ wrapper `solis_compile.hpp`) | Turns `.sl` source into a bytecode image, with readable errors. | Only if your application accepts source. |
 
 That gives you two ways to embed, and you can choose per project:
@@ -247,7 +247,7 @@ Two scripts that declare the same host function with different types are a compi
 Two details about strings and maps:
 
 - `sl_as_str(v, &len)` returns a pointer and a length. Use the length; do not assume the data is NUL-terminated.
-- Map lookup is a linear scan, not a hash table, so it suits small maps.
+- Map lookup is hashed (a plain scan while a map holds eight pairs or fewer). Pairs iterate in insertion order, and removing a key rebuilds the index, so heavy removal from a large map costs O(n) each.
 
 ### Errors from natives
 

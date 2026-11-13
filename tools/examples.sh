@@ -12,6 +12,9 @@ EXAMPLES=(
     examples/generics.sl
     examples/generic_funcs.sl
     examples/map_demo.sl
+    examples/map_large.sl
+    examples/branches.sl
+    examples/registers.sl
     examples/option_result.sl
     examples/slices.sl
     examples/test_demo.sl

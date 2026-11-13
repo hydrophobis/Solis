@@ -1,0 +1,96 @@
+# Rewrite rules over register code. Each rule is checked by tools/optrules.py
+# (--verify) and compiled into runtime/opt_rules.inc (--gen).
+#
+#   rule <name>
+#     <pattern instr> ; <pattern instr> ...
+#     when <condition> ...
+#     => <replacement instr> ; ...
+#
+# Registers are lowercase names, immediates start with k, a jump target is j.
+# An expression in parentheses may add immediates: (k1+k2), (0-k).
+# Conditions: dead(r)  the register is not read again after the window
+#             fits16(expr)  eq(a,b)  ne(a,b)  nonneg(expr)
+
+rule addi_chain
+  ADDI t a k1 ; ADDI d t k2
+  when dead(t) fits16(k1+k2)
+  => ADDI d a (k1+k2)
+
+rule addi_zero_move
+  ADDI d a 0
+  when ne(d,a)
+  => MOVS d a
+
+rule addi_zero_noop
+  ADDI a a 0
+  =>
+
+rule ldi_fold_addi
+  LDI t k1 ; ADDI d t k2
+  when dead(t) fits16(k1+k2)
+  => LDI d (k1+k2)
+
+rule ldi_add_right
+  LDI t k ; ADD_I d a t
+  when dead(t) ne(a,t)
+  => ADDI d a k
+
+rule ldi_add_left
+  LDI t k ; ADD_I d t a
+  when dead(t) ne(a,t)
+  => ADDI d a k
+
+rule ldi_sub
+  LDI t k ; SUB_I d a t
+  when dead(t) ne(a,t) fits16(0-k)
+  => ADDI d a (0-k)
+
+rule mul_two
+  LDI t 2 ; MUL_I d a t
+  when dead(t) ne(a,t)
+  => ADD_I d a a
+
+rule movs_forward
+  MOVS t a ; ADDI d t k
+  when dead(t)
+  => ADDI d a k
+
+rule movs_self
+  MOVS a a
+  =>
+
+rule ldi_compare_lt
+  LDI t k ; JC_LT_I a t j
+  when dead(t) ne(a,t)
+  => JCI_LT a k j
+
+rule ldi_compare_ge
+  LDI t k ; JC_GE_I a t j
+  when dead(t) ne(a,t)
+  => JCI_GE a k j
+
+rule ldi_compare_gt
+  LDI t k ; JC_GT_I a t j
+  when dead(t) ne(a,t)
+  => JCI_GT a k j
+
+rule ldi_compare_le
+  LDI t k ; JC_LE_I a t j
+  when dead(t) ne(a,t)
+  => JCI_LE a k j
+
+rule ldi_compare_eq
+  LDI t k ; JC_EQ_I a t j
+  when dead(t) ne(a,t)
+  => JCI_EQ a k j
+
+rule ldi_compare_ne
+  LDI t k ; JC_NE_I a t j
+  when dead(t) ne(a,t)
+  => JCI_NE a k j
+
+# `let k = len(a)` writes the length straight into k
+rule alen_move
+  ALEN_L t a ; MOVS d t
+  when dead(t) ne(d,a)
+  => ALEN_L d a

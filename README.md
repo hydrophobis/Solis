@@ -57,6 +57,7 @@ A host links the VM from `runtime/` and registers native functions, with signatu
 - [`std/`](std): the standard library, written in Solis itself.
 - [`examples/`](examples): a language tour, a host-embedding example, a
   benchmark, a plugin system built on the prelude.
+- [`benchmarks/`](benchmarks): Solis, C and Lua versions of the same workloads, `run.sh`, and [results](benchmarks/RESULTS.md).
 - [`tests/`](tests): output bytecode and expected output, checked by
   [`tools/conform.sh`](tools/conform.sh).
 

@@ -159,6 +159,13 @@ uint8_t *bc_serialize(bc_program *p, size_t *len_out) {
         if (sn) ob_push(&b, sig, sn);
     }
 
+    ob_u16(&b, (uint16_t)p->structs.len);
+    for (int i = 0; i < p->structs.len; i++) {
+        struct_desc *d = &p->structs.at[i];
+        ob_u8(&b, d->n);
+        ob_push(&b, d->kinds, d->n);
+    }
+
     ob_u16(&b, p->nglobals);
 
     ob_u16(&b, (uint16_t)p->funcs.len);
@@ -241,3 +248,4 @@ void em_jump_back(emitter *e, opcode op, int target) {
 }
 
 int em_here(const emitter *e) { return e->len; }
+

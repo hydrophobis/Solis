@@ -1,0 +1,6 @@
+len 1000 bad 0
+after remove len 666 has3 false has4 true has999 false
+sum 998001
+77 88 667
+201 1150 1 true false
+30 half x3

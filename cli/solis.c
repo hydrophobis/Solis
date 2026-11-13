@@ -18,6 +18,9 @@ static void usage(void) {
             "usage: solis [options] <file.sl|file.slb> [script args...]\n"
             "\n"
             "  -o <file.slb>     compile to an image instead of running\n"
+#ifdef SL_AOT_EMITTER
+            "  --emit-c <file.c> translate to C instead of running\n"
+#endif
             "  --check           type check only\n"
             "  --prelude <file>  host declarations every module can see\n"
             "  --no-prelude      ignore a prelude.sl sitting beside the script\n"
@@ -154,6 +157,7 @@ static int run_image(sl_vm *vm, const uint8_t *bytes, size_t len, bool check_lea
 int main(int argc, char **argv) {
     const char *in_path = NULL;
     const char *out_path = NULL;
+    const char *emit_c_path = NULL;
     const char *prelude = NULL;
     bool no_prelude = false;
     bool want_tokens = false;
@@ -166,6 +170,7 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
+        else if (strcmp(argv[i], "--emit-c") == 0 && i + 1 < argc) emit_c_path = argv[++i];
         else if (strcmp(argv[i], "--prelude") == 0 && i + 1 < argc) prelude = argv[++i];
         else if (strcmp(argv[i], "--no-prelude") == 0) no_prelude = true;
         else if (strcmp(argv[i], "--check") == 0) want_check = true;
@@ -328,6 +333,21 @@ int main(int argc, char **argv) {
 
     free(host_decls);
     arena_free(&a);
+
+#ifdef SL_AOT_EMITTER
+    if (emit_c_path) {
+        extern int sl_emit_c(sl_vm *, const uint8_t *, size_t, FILE *);
+        sl_result lr = sl_load(vm, bytes, len);
+        if (lr != SL_OK) { fprintf(stderr, "load error: %s\n", sl_error(vm)); return 1; }
+        FILE *f = fopen(emit_c_path, "w");
+        if (!f) { fprintf(stderr, "solis: cannot write %s\n", emit_c_path); return 2; }
+        sl_emit_c(vm, bytes, len, f);
+        fclose(f);
+        free(bytes);
+        sl_free(vm);
+        return 0;
+    }
+#endif
 
     if (out_path || want_stats) {
         free(bytes);

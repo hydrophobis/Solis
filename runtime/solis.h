@@ -53,7 +53,8 @@ struct sl_obj {
 
 static inline sl_value sl_int(int64_t v)  { sl_value x; x.type = SL_INT;   x.as.i = v; return x; }
 static inline sl_value sl_float(double v) { sl_value x; x.type = SL_FLOAT; x.as.f = v; return x; }
-static inline sl_value sl_bool(bool v)    { sl_value x; x.type = SL_BOOL;  x.as.b = v; return x; }
+// Writes the whole payload word so a later 8-byte read of it forwards from this store.
+static inline sl_value sl_bool(bool v)    { sl_value x; x.type = SL_BOOL;  x.as.i = v; return x; }
 static inline sl_value sl_void(void)      { sl_value x; x.type = SL_VOID;  x.as.i = 0; return x; }
 
 typedef struct sl_vm sl_vm;
@@ -111,8 +112,8 @@ bool        sl_array_remove(sl_vm *vm, sl_value arr, int64_t i, sl_value *out);
 bool        sl_array_insert(sl_vm *vm, sl_value arr, int64_t i, sl_value item);
 
 // sl_map_set takes ownership of `key`/`val`. sl_map_get hands the stored
-// value back borrowed; sl_map_remove hands both back owned. Lookup is
-// O(n) linear scan over key/value pairs, not a hash table.
+// value back borrowed; sl_map_remove hands both back owned. Lookup is a
+// hash lookup (a scan while the map is small); pairs keep insertion order.
 sl_value    sl_map(sl_vm *vm, int64_t cap);
 int64_t     sl_map_len(sl_value v);
 bool        sl_map_get(sl_value m, sl_value key, sl_value *out);

@@ -23,7 +23,7 @@
 #include "common.h"
 
 #define SL_MAGIC   "SLBC"
-#define SL_VERSION 6
+#define SL_VERSION 9
 
 typedef enum {
     // Push a small integer encoded in the instruction itself.
@@ -65,10 +65,11 @@ typedef enum {
     OP_EQ_B = 50, OP_NE_B = 51, OP_NOT = 52,
 
     // Signed 16-bit relative jumps, measured from the end of the operand.
-    OP_JUMP = 60, OP_JUMP_IF_FALSE = 61,
+    OP_JUMP = 60, OP_JUMP_IF_FALSE = 61, OP_JUMP_IF_TRUE = 62,
 
-    OP_CALL = 70,       // u16 function, u8 argc
-    OP_NATIVE = 71,     // u16 index, u8 argc
+    // u8 nres is 1 when the callee leaves a value, 0 when it returns nothing.
+    OP_CALL = 70,       // u16 function, u8 argc, u8 nres
+    OP_NATIVE = 71,     // u16 index, u8 argc, u8 nres
     OP_RET = 72,
     OP_RET_VOID = 73,
 
@@ -77,7 +78,7 @@ typedef enum {
     OP_NEW_ARRAY = 100, // u16 count, pops that many values
     OP_AGET = 101, OP_ASET = 102, OP_ALEN = 103, OP_APUSH = 104,
 
-    OP_NEW_STRUCT = 110,// u16 nfields, pops that many, in field order
+    OP_NEW_STRUCT = 110,// u16 nfields, u16 type id, pops that many, in field order
     OP_FGET = 111, OP_FSET = 112,
 
     OP_NEW_VARIANT = 120, // u16 tag, u8 npayload
@@ -86,7 +87,7 @@ typedef enum {
     OP_LOADG = 130, OP_STOREG = 131,
 
     OP_DUP2 = 140,
-    OP_COPY = 141,
+    OP_COPY = 141,      // u16 struct type id, 0xFFFF if not known
 
     // Push a null reference: SL_OBJ with a NULL payload.
     OP_NULL = 142,
@@ -121,12 +122,17 @@ typedef struct {
     size_t      code_len;
 } bc_func;
 
+// Layout of one struct type, for backends that want to store it unboxed.
+// kinds: 0 anything else, 1 int, 2 float, 3 bool.
+typedef struct { uint8_t n; uint8_t kinds[32]; } struct_desc;
+
 typedef struct {
     arena *a;
     VEC(constant)     consts;
     VEC(const char *) natives;
     VEC(const char *) native_sigs;   // parallel to natives; NULL for an intrinsic
     VEC(bc_func)      funcs;
+    VEC(struct_desc)  structs;
     uint16_t          entry;
     uint16_t          nglobals;
     // Interning, so repeated literals share one constant slot. The maps hold
@@ -170,5 +176,6 @@ void em_patch_to(emitter *e, int at, int target);
 // A backwards jump to `target`, for loops.
 void em_jump_back(emitter *e, opcode op, int target);
 int  em_here(const emitter *e);
+
 
 #endif // SOLIS_EMIT_H

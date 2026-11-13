@@ -15,6 +15,7 @@ typedef VEC(slot) slot_vec;
 
 typedef struct {
     slot_vec fields;
+    int      id;        // index into the image's struct table, or 0xFFFF
 } layout;
 
 typedef struct {
@@ -207,7 +208,19 @@ static void maybe_copy(gen *G, ty *t, emitter *e) {
     else if (t->kind == TK_ERROR) could_be_struct = true;
     else could_be_struct = false;
 
-    if (could_be_struct) em_op(e, OP_COPY);
+    if (could_be_struct) {
+        layout *l = t->kind == TK_NAMED ? (layout *)map_get(&G->layouts, t->name) : NULL;
+        em_op(e, OP_COPY);
+        em_u16(e, (uint16_t)(l ? l->id : 0xFFFF));
+    }
+}
+
+// A struct literal builds a new object, so nothing else can hold it and the
+// copy would only allocate and free. Calls are not treated this way: a
+// function may return a struct it shares with something else.
+static void copy_unless_fresh(gen *G, expr *x, ty *t, emitter *e) {
+    if (x->kind == EX_STRUCT_LIT) return;
+    maybe_copy(G, t, e);
 }
 
 static layout *layout_of(gen *G, ty *t) {
@@ -257,7 +270,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
                     if (strcmp(el->variants.at[tag].name, name) != 0) continue;
                     for (int i = 0; i < args->len; i++) {
                         ty *t = gen_expr(G, args->at[i], e);
-                        maybe_copy(G, t, e);
+                        copy_unless_fresh(G, args->at[i], t, e);
                     }
                     em_op(e, OP_NEW_VARIANT);
                     em_u16(e, (uint16_t)tag);
@@ -278,6 +291,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
                 em_op(e, OP_NATIVE);
                 em_u16(e, native_slot(G, nn, q, at));
                 em_u8(e, (uint8_t)args->len);
+                em_u8(e, sig_ret(G, q)->kind != TK_VOID);
                 return sig_ret(G, q);
             }
             void *id = map_get(&G->func_ids, q);
@@ -286,6 +300,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
                 em_op(e, OP_CALL);
                 em_u16(e, (uint16_t)UNSLOT(id));
                 em_u8(e, (uint8_t)args->len);
+                em_u8(e, sig_ret(G, q)->kind != TK_VOID);
                 return sig_ret(G, q);
             }
         }
@@ -307,6 +322,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
                     em_op(e, OP_CALL);
                     em_u16(e, (uint16_t)UNSLOT(id));
                     em_u8(e, (uint8_t)(args->len + 1));
+                    em_u8(e, sig_ret(G, q)->kind != TK_VOID);
                     return sig_ret(G, q);
                 }
             }
@@ -316,7 +332,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
                 (strcmp(name, "len") == 0 || strcmp(name, "push") == 0)) {
                 for (int i = 0; i < args->len; i++) {
                     ty *t = gen_expr(G, args->at[i], e);
-                    if (strcmp(name, "push") == 0) maybe_copy(G, t, e);
+                    if (strcmp(name, "push") == 0) copy_unless_fresh(G, args->at[i], t, e);
                 }
                 em_op(e, strcmp(name, "len") == 0 ? OP_ALEN : OP_APUSH);
                 return strcmp(name, "len") == 0 ? ty_int() : ty_void();
@@ -334,7 +350,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
                 if (strcmp(el->variants.at[tag].name, name) != 0) continue;
                 for (int i = 0; i < args->len; i++) {
                     ty *t = gen_expr(G, args->at[i], e);
-                    maybe_copy(G, t, e);
+                    copy_unless_fresh(G, args->at[i], t, e);
                 }
                 em_op(e, OP_NEW_VARIANT);
                 em_u16(e, (uint16_t)tag);
@@ -349,6 +365,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
             em_op(e, OP_CALL);
             em_u16(e, (uint16_t)UNSLOT(id));
             em_u8(e, (uint8_t)args->len);
+            em_u8(e, sig_ret(G, fq)->kind != TK_VOID);
             return sig_ret(G, fq);
         }
         gerr(G, at, NULL, arena_printf(G->a, "unknown `%s.%s`", chain, name));
@@ -370,7 +387,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
     if (!has_local && (strcmp(name, "len") == 0 || strcmp(name, "push") == 0)) {
         for (int i = 0; i < args->len; i++) {
             ty *t = gen_expr(G, args->at[i], e);
-            if (strcmp(name, "push") == 0) maybe_copy(G, t, e);
+            if (strcmp(name, "push") == 0) copy_unless_fresh(G, args->at[i], t, e);
         }
         em_op(e, strcmp(name, "len") == 0 ? OP_ALEN : OP_APUSH);
         return strcmp(name, "len") == 0 ? ty_int() : ty_void();
@@ -391,8 +408,10 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
         em_op(e, OP_NATIVE);
         em_u16(e, native_slot(G, name, NULL, x->at));
         em_u8(e, (uint8_t)args->len);
-        if (strcmp(name, "print") == 0 || strcmp(name, "reverse") == 0 ||
-            strcmp(name, "insertAt") == 0 || strcmp(name, "sort") == 0) return ty_void();
+        bool intrinsic_void = strcmp(name, "print") == 0 || strcmp(name, "reverse") == 0 ||
+                              strcmp(name, "insertAt") == 0 || strcmp(name, "sort") == 0;
+        em_u8(e, !intrinsic_void);
+        if (intrinsic_void) return ty_void();
         if (strcmp(name, "sqrt") == 0) return ty_float();
         if (strcmp(name, "indexOf") == 0) return ty_int();
         if (strcmp(name, "contains") == 0) return ty_bool();
@@ -423,6 +442,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
         em_op(e, OP_NATIVE);
         em_u16(e, native_slot(G, nn, q, at));
         em_u8(e, (uint8_t)args->len);
+        em_u8(e, sig_ret(G, q)->kind != TK_VOID);
         return sig_ret(G, q);
     }
     void *id = map_get(&G->func_ids, q);
@@ -430,6 +450,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
         em_op(e, OP_CALL);
         em_u16(e, (uint16_t)UNSLOT(id));
         em_u8(e, (uint8_t)args->len);
+        em_u8(e, sig_ret(G, q)->kind != TK_VOID);
         return sig_ret(G, q);
     }
     gerr(G, at, NULL, arena_printf(G->a, "`%s` cannot be called", name));
@@ -455,6 +476,39 @@ static void gen_arith(gen *G, bin_op op, ty *t, span at, emitter *e) {
             break;
     }
     em_op(e, o);
+}
+
+// Compile a condition as control flow. Execution falls through when `x`
+// evaluates to `!jump_when` and jumps, to a site recorded in `out` for the
+// caller to patch, when it evaluates to `jump_when`. Short-circuit operators
+// become branches directly instead of materialising a bool.
+typedef VEC(int) int_vec;
+
+static void gen_branch(gen *G, expr *x, emitter *e, bool jump_when, int_vec *out) {
+    if (x->kind == EX_UNARY && x->as.unary.op == UN_NOT) {
+        gen_branch(G, x->as.unary.rhs, e, !jump_when, out);
+        return;
+    }
+    if (x->kind == EX_BINARY && (x->as.binary.op == OP_AND || x->as.binary.op == OP_OR)) {
+        bool is_and = x->as.binary.op == OP_AND;
+        expr *lhs = x->as.binary.lhs, *rhs = x->as.binary.rhs;
+        // `a && b` jumping on false, or `a || b` jumping on true: either
+        // operand alone decides, so both jump to the same place.
+        if (is_and == !jump_when) {
+            gen_branch(G, lhs, e, jump_when, out);
+            gen_branch(G, rhs, e, jump_when, out);
+        } else {
+            // The left operand decides the other way: it skips the right one.
+            int_vec skip;
+            memset(&skip, 0, sizeof skip);
+            gen_branch(G, lhs, e, !jump_when, &skip);
+            gen_branch(G, rhs, e, jump_when, out);
+            for (int i = 0; i < skip.len; i++) em_patch(e, skip.at[i]);
+        }
+        return;
+    }
+    gen_expr(G, x, e);
+    vec_push(G->a, out, em_jump(e, jump_when ? OP_JUMP_IF_TRUE : OP_JUMP_IF_FALSE));
 }
 
 static ty *gen_binary(gen *G, expr *x, emitter *e) {
@@ -503,6 +557,7 @@ static ty *gen_binary(gen *G, expr *x, emitter *e) {
         em_op(e, OP_NATIVE);
         em_u16(e, bc_add_native(G->prog, intern_z(G->in, " eq"), NULL));
         em_u8(e, 2);
+        em_u8(e, 1);
         if (op == OP_NE) em_op(e, OP_NOT);
         return ty_bool();
     }
@@ -611,7 +666,7 @@ static ty *gen_expr(gen *G, expr *x, emitter *e) {
             ty *elem = ty_error();
             for (int i = 0; i < x->as.array.len; i++) {
                 ty *t = gen_expr(G, x->as.array.at[i], e);
-                maybe_copy(G, t, e);
+                copy_unless_fresh(G, x->as.array.at[i], t, e);
                 if (i == 0) elem = t;
             }
             em_op(e, OP_NEW_ARRAY);
@@ -679,7 +734,7 @@ static ty *gen_expr(gen *G, expr *x, emitter *e) {
                         v = x->as.struct_lit.fields.at[k].value;
                 if (v) {
                     ty *t = gen_expr(G, v, e);
-                    maybe_copy(G, t, e);
+                    copy_unless_fresh(G, v, t, e);
                 } else {
                     gerr(G, x->at, NULL,
                          arena_printf(G->a, "missing field `%s`", fname));
@@ -688,6 +743,7 @@ static ty *gen_expr(gen *G, expr *x, emitter *e) {
             }
             em_op(e, OP_NEW_STRUCT);
             em_u16(e, (uint16_t)l->fields.len);
+            em_u16(e, (uint16_t)l->id);
             return ty_named(G->a, intern_z(G->in, name));
         }
 
@@ -757,9 +813,9 @@ static ty *gen_expr(gen *G, expr *x, emitter *e) {
             ty *kt = ty_error(), *vt = ty_error();
             for (int i = 0; i < x->as.map.len; i++) {
                 ty *k = gen_expr(G, x->as.map.at[i].k, e);
-                maybe_copy(G, k, e);
+                copy_unless_fresh(G, x->as.map.at[i].k, k, e);
                 ty *v = gen_expr(G, x->as.map.at[i].v, e);
-                maybe_copy(G, v, e);
+                copy_unless_fresh(G, x->as.map.at[i].v, v, e);
                 if (i == 0) { kt = k; vt = v; }
             }
             em_op(e, OP_NEW_MAP);
@@ -803,7 +859,7 @@ static void gen_assign(gen *G, stmt *s, emitter *e) {
             }
             if (op == ASSIGN_SET) {
                 ty *vt = gen_expr(G, value, e);
-                maybe_copy(G, vt, e);
+                copy_unless_fresh(G, value, vt, e);
             } else {
                 em_op(e, OP_LOAD);
                 em_u8(e, slot);
@@ -819,7 +875,7 @@ static void gen_assign(gen *G, stmt *s, emitter *e) {
         if (gi) {
             if (op == ASSIGN_SET) {
                 ty *vt = gen_expr(G, value, e);
-                maybe_copy(G, vt, e);
+                copy_unless_fresh(G, value, vt, e);
             } else {
                 em_op(e, OP_LOADG);
                 em_u16(e, gi->index);
@@ -844,7 +900,7 @@ static void gen_assign(gen *G, stmt *s, emitter *e) {
         }
         if (op == ASSIGN_SET) {
             ty *vt = gen_expr(G, value, e);
-            maybe_copy(G, vt, e);
+            copy_unless_fresh(G, value, vt, e);
         } else {
             // Re-read the field to combine with it.
             ty *ft = field_ty(G, bt, place->as.field.name);
@@ -865,7 +921,7 @@ static void gen_assign(gen *G, stmt *s, emitter *e) {
         bool is_map = bt->kind == TK_MAP;
         if (op == ASSIGN_SET) {
             ty *vt = gen_expr(G, value, e);
-            maybe_copy(G, vt, e);
+            copy_unless_fresh(G, value, vt, e);
         } else {
             ty *elem = is_map ? bt->val : bt->kind == TK_ARRAY ? bt->elem : ty_error();
             // Keep the array/map and index/key for the store, and take a
@@ -947,10 +1003,7 @@ static void gen_switch(gen *G, stmt *s, emitter *e) {
                 // False means no pattern matched: try the next case.
                 vec_push(G->a, &misses, em_jump(e, OP_JUMP_IF_FALSE));
             } else {
-                // There is no JUMP_IF_TRUE, so invert and reuse
-                // JUMP_IF_FALSE: it now fires when the tag matched.
-                em_op(e, OP_NOT);
-                vec_push(G->a, &hits, em_jump(e, OP_JUMP_IF_FALSE));
+                vec_push(G->a, &hits, em_jump(e, OP_JUMP_IF_TRUE));
             }
 
             binding_vec *bs = &pat->as.variant.bindings;
@@ -1021,7 +1074,7 @@ static void gen_stmt(gen *G, stmt *s, emitter *e) {
                 }
             }
             ty *t = gen_expr(G, val, e);
-            maybe_copy(G, t, e);
+            copy_unless_fresh(G, val, t, e);
             uint8_t slot = declare(G, s->as.let_.name, t);
             em_op(e, OP_STORE);
             em_u8(e, slot);
@@ -1033,24 +1086,26 @@ static void gen_stmt(gen *G, stmt *s, emitter *e) {
             return;
 
         case ST_IF: {
-            gen_expr(G, s->as.if_.cond, e);
-            int else_jump = em_jump(e, OP_JUMP_IF_FALSE);
+            int_vec to_else;
+            memset(&to_else, 0, sizeof to_else);
+            gen_branch(G, s->as.if_.cond, e, false, &to_else);
             gen_block(G, s->as.if_.then, e);
             if (s->as.if_.els) {
                 int end = em_jump(e, OP_JUMP);
-                em_patch(e, else_jump);
+                for (int i = 0; i < to_else.len; i++) em_patch(e, to_else.at[i]);
                 gen_stmt(G, s->as.if_.els, e);
                 em_patch(e, end);
             } else {
-                em_patch(e, else_jump);
+                for (int i = 0; i < to_else.len; i++) em_patch(e, to_else.at[i]);
             }
             return;
         }
 
         case ST_WHILE: {
             int top = em_here(e);
-            gen_expr(G, s->as.while_.cond, e);
-            int exit = em_jump(e, OP_JUMP_IF_FALSE);
+            int_vec exits;
+            memset(&exits, 0, sizeof exits);
+            gen_branch(G, s->as.while_.cond, e, false, &exits);
 
             loop_ctx ctx;
             memset(&ctx, 0, sizeof ctx);
@@ -1061,7 +1116,7 @@ static void gen_stmt(gen *G, stmt *s, emitter *e) {
             for (int i = 0; i < done.continues.len; i++)
                 em_patch_to(e, done.continues.at[i], top);
             em_jump_back(e, OP_JUMP, top);
-            em_patch(e, exit);
+            for (int i = 0; i < exits.len; i++) em_patch(e, exits.at[i]);
             for (int i = 0; i < done.breaks.len; i++) em_patch(e, done.breaks.at[i]);
             return;
         }
@@ -1262,7 +1317,7 @@ static uint16_t emit_start(gen *G, uint16_t main_id) {
             item *it = &m->prog->items.at[i];
             if (it->kind != IT_LET || it->as.let->kind != ST_LET) continue;
             ty *t = gen_expr(G, it->as.let->as.let_.value, &e);
-            maybe_copy(G, t, &e);
+            copy_unless_fresh(G, it->as.let->as.let_.value, t, &e);
             global_info *gi = (global_info *)map_get(
                 &G->globals, arena_printf(G->a, "%s.%s", m->name, it->as.let->as.let_.name));
             if (gi) {
@@ -1274,12 +1329,14 @@ static uint16_t emit_start(gen *G, uint16_t main_id) {
         }
     }
 
+    // RET_VOID leaves nothing behind, so only discard a real result.
+    fn_sig *msig = (fn_sig *)map_get(&G->sigs, arena_printf(G->a, "%s.main", G->l->root));
+    bool main_returns = msig && msig->ret->kind != TK_VOID;
     em_op(&e, OP_CALL);
     em_u16(&e, main_id);
     em_u8(&e, 0);
-    // RET_VOID leaves nothing behind, so only discard a real result.
-    fn_sig *msig = (fn_sig *)map_get(&G->sigs, arena_printf(G->a, "%s.main", G->l->root));
-    if (msig && msig->ret->kind != TK_VOID) em_op(&e, OP_POP);
+    em_u8(&e, main_returns);
+    if (main_returns) em_op(&e, OP_POP);
     em_op(&e, OP_HALT);
 
     G->prog->funcs.at[id].nslots = G->nslots;
@@ -1323,6 +1380,18 @@ bc_program *generate(arena *a, sl_interner *in, loaded *l, decls *d, diag_vec *d
             s.name = si->fields.at[k].name;
             s.t = si->fields.at[k].t;
             vec_push(a, &lay->fields, s);
+        }
+        lay->id = 0xFFFF;
+        if (lay->fields.len <= 32) {
+            struct_desc sd;
+            memset(&sd, 0, sizeof sd);
+            sd.n = (uint8_t)lay->fields.len;
+            for (int k = 0; k < lay->fields.len; k++) {
+                ty *ft = lay->fields.at[k].t;
+                sd.kinds[k] = ft->kind == TK_INT ? 1 : ft->kind == TK_FLOAT ? 2 : ft->kind == TK_BOOL ? 3 : 0;
+            }
+            lay->id = prog->structs.len;
+            vec_push(a, &prog->structs, sd);
         }
         map_put(&G.layouts, key, lay);
     }

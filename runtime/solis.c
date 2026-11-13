@@ -12,6 +12,7 @@
 #define SL_STACK_MAX   4096
 #define SL_FRAMES_MAX  256
 #define SL_NATIVES_MAX 128
+#define SL_POOL_FIELDS 8   // structs up to this many fields are recycled, not freed
 
 enum {
     OP_CONST_I8 = 0, OP_CONST = 1, OP_TRUE = 2, OP_FALSE = 3, OP_POP = 4,
@@ -29,7 +30,7 @@ enum {
 
     OP_EQ_B = 50, OP_NE_B, OP_NOT,
 
-    OP_JUMP = 60, OP_JUMP_IF_FALSE,
+    OP_JUMP = 60, OP_JUMP_IF_FALSE, OP_JUMP_IF_TRUE,
 
     OP_CALL = 70, OP_NATIVE, OP_RET, OP_RET_VOID,
 
@@ -56,12 +57,31 @@ typedef struct {
     char     bytes[1];  // NUL-terminated, over-allocated
 } sl_string;
 
+// Arrays store their elements packed when they are all ints, all floats or all
+// bools, and as tagged values otherwise. The kind is decided by the first
+// element and falls back to tagged values if a different kind ever arrives.
+enum { AK_NONE, AK_INT, AK_FLT, AK_BOOL, AK_GEN };
+
 typedef struct {
     sl_obj    head;
     int64_t   len;
     int64_t   cap;
-    sl_value *items;
+    void     *data;
+    uint8_t   ek;
 } sl_arr;
+
+static inline size_t ak_size(int ek) {
+    static const uint8_t sizes[] = { 0, 8, 8, 1, sizeof(sl_value) };
+    return sizes[ek];
+}
+static inline int ak_of(sl_value v) {
+    switch (v.type) {
+        case SL_INT:   return AK_INT;
+        case SL_FLOAT: return AK_FLT;
+        case SL_BOOL:  return AK_BOOL;
+        default:       return AK_GEN;
+    }
+}
 
 typedef struct {
     sl_obj   head;
@@ -76,13 +96,15 @@ typedef struct {
     sl_value payload[1];
 } sl_variant;
 
-typedef struct { sl_value key, val; } map_pair;
+typedef struct { sl_value key, val; uint64_t hash; } map_pair;
 
 typedef struct {
     sl_obj    head;
     int64_t   len;
     int64_t   cap;
-    map_pair *pairs;
+    map_pair *pairs;        // dense, in insertion order
+    uint32_t *index;        // open-addressed, pair index + 1, 0 = empty; NULL while small
+    uint32_t  index_cap;    // a power of two
 } sl_map_obj;
 
 typedef enum { C_INT, C_FLOAT, C_STR } const_type;
@@ -96,14 +118,17 @@ typedef struct {
     char    *name;
     uint8_t  arity;
     uint16_t nslots;
-    uint8_t *code;
+    uint8_t *code;          // stack code, from the image; freed once translated
     uint32_t code_len;
+    uint16_t *rcode;        // register code, see below
+    uint32_t rlen;
+    uint16_t nregs;         // frame size: locals plus temporaries
 } sl_func;
 
 typedef struct {
     sl_func  *fn;
-    uint8_t  *ip;
-    sl_value *slots;
+    uint16_t *ip;       // where to resume; only meaningful for a frame that has called
+    sl_value *base;
 } sl_frame;
 
 struct sl_vm {
@@ -118,6 +143,8 @@ struct sl_vm {
     int *native_bind;
 
     uint16_t entry;
+    uint16_t nstructs;
+    uint8_t (*struct_desc)[33];     // per struct type: field count, then field kinds
 
     sl_value  stack[SL_STACK_MAX];
     sl_value *sp;
@@ -125,11 +152,14 @@ struct sl_vm {
     int nframes;
 
     int64_t live;       // heap objects alive, for leak checks
+    sl_value *kstr;     // shared string objects for the image's string constants, made on first use
+    int64_t   nkstr;    // how many of them exist, so leak checks can ignore them
+    void   *free_struct[SL_POOL_FIELDS + 1];   // recycled small structs, by field count
     char err[1024];
     bool failed;
 };
 
-int64_t sl_live_objects(const sl_vm *vm) { return vm->live; }
+int64_t sl_live_objects(const sl_vm *vm) { return vm->live - vm->nkstr; }
 
 int sl_natives_free(const sl_vm *vm) { return SL_NATIVES_MAX - vm->nregistered; }
 
@@ -148,6 +178,41 @@ void sl_fail(sl_vm *vm, const char *msg) {
 
 const char *sl_error(const sl_vm *vm) { return vm->err; }
 
+// Values move as a 4-byte tag and an 8-byte payload, never as one 16-byte
+// copy. Most writes are scalar, and a vector load that spans two recent
+// scalar stores cannot be forwarded from the store buffer, which stalls every
+// read that follows a write to the same register.
+static inline sl_value vload(const sl_value *p) {
+    sl_value v;
+    v.type = p->type;
+    v.as.i = p->as.i;
+    return v;
+}
+static inline void vstore(sl_value *p, sl_value v) {
+    p->type = v.type;
+    p->as.i = v.as.i;
+}
+
+static inline sl_value arr_get(const sl_arr *a, int64_t i) {
+    sl_value v;
+    switch (a->ek) {
+        case AK_INT:  v.type = SL_INT;   v.as.i = ((const int64_t *)a->data)[i]; break;
+        case AK_FLT:  v.type = SL_FLOAT; v.as.f = ((const double *)a->data)[i]; break;
+        case AK_BOOL: v.type = SL_BOOL;  v.as.i = ((const uint8_t *)a->data)[i]; break;
+        default:      v = vload(&((const sl_value *)a->data)[i]);
+    }
+    return v;
+}
+// Store a value of the array's own kind.
+static inline void arr_put(sl_arr *a, int64_t i, sl_value v) {
+    switch (a->ek) {
+        case AK_INT:  ((int64_t *)a->data)[i] = v.as.i; break;
+        case AK_FLT:  ((double *)a->data)[i] = v.as.f; break;
+        case AK_BOOL: ((uint8_t *)a->data)[i] = (uint8_t)(v.as.i != 0); break;
+        default:      vstore(&((sl_value *)a->data)[i], v);
+    }
+}
+
 void sl_release(sl_vm *vm, sl_value v) {
     if (v.type != SL_OBJ || !v.as.o) return;
     sl_obj *o = v.as.o;
@@ -161,13 +226,21 @@ void sl_release(sl_vm *vm, sl_value v) {
             break;
         case SL_ARRAY: {
             sl_arr *a = (sl_arr *)o;
-            for (int64_t i = 0; i < a->len; i++) sl_release(vm, a->items[i]);
-            free(a->items);
+            if (a->ek == AK_GEN)
+                for (int64_t i = 0; i < a->len; i++) sl_release(vm, ((sl_value *)a->data)[i]);
+            free(a->data);
             break;
         }
         case SL_STRUCT: {
             sl_struct *s = (sl_struct *)o;
-            for (uint16_t i = 0; i < s->nfields; i++) sl_release(vm, s->fields[i]);
+            for (uint16_t i = 0; i < s->nfields; i++)
+                if (s->fields[i].type == SL_OBJ) sl_release(vm, s->fields[i]);
+            if (s->nfields <= SL_POOL_FIELDS) {
+                *(void **)s = vm->free_struct[s->nfields];
+                vm->free_struct[s->nfields] = s;
+                vm->live--;
+                return;
+            }
             break;
         }
         case SL_VARIANT: {
@@ -182,6 +255,7 @@ void sl_release(sl_vm *vm, sl_value v) {
                 sl_release(vm, m->pairs[i].val);
             }
             free(m->pairs);
+            free(m->index);
             break;
         }
     }
@@ -194,6 +268,17 @@ static sl_value obj_value(sl_obj *o) {
     v.type = SL_OBJ;
     v.as.o = o;
     return v;
+}
+
+// Structs are small and short-lived, and malloc dominates building one, so
+// freed ones are kept on a list per field count and handed back out.
+static sl_struct *struct_alloc(sl_vm *vm, uint16_t n) {
+    if (n <= SL_POOL_FIELDS && vm->free_struct[n]) {
+        sl_struct *s = (sl_struct *)vm->free_struct[n];
+        vm->free_struct[n] = *(void **)s;
+        return s;
+    }
+    return (sl_struct *)malloc(sizeof(sl_struct) + (n ? n - 1 : 0) * sizeof(sl_value));
 }
 
 sl_value sl_str(sl_vm *vm, const char *bytes, size_t n) {
@@ -209,6 +294,34 @@ sl_value sl_str(sl_vm *vm, const char *bytes, size_t n) {
 }
 
 sl_value sl_cstr(sl_vm *vm, const char *z) { return sl_str(vm, z, strlen(z)); }
+
+// A string of `n` bytes whose contents the caller fills in (and NUL-terminates).
+static sl_string *str_alloc(sl_vm *vm, size_t n) {
+    sl_string *s = (sl_string *)malloc(sizeof(sl_string) + n);
+    if (!s) { vm_error(vm, "out of memory"); return NULL; }
+    s->head.rc = 1;
+    s->head.kind = SL_STR;
+    s->len = n;
+    s->bytes[n] = 0;
+    vm->live++;
+    return s;
+}
+
+// Strings never change after they are made, so a constant is one shared object.
+static sl_value const_str(sl_vm *vm, uint16_t k) {
+    if (!vm->kstr) vm->kstr = (sl_value *)calloc(vm->nconsts ? vm->nconsts : 1, sizeof(sl_value));
+    if (vm->kstr && vm->kstr[k].type == SL_OBJ) {
+        sl_value v = vm->kstr[k];
+        v.as.o->rc++;
+        return v;
+    }
+    sl_value v = sl_str(vm, vm->consts[k].as.s.p, vm->consts[k].as.s.n);
+    if (vm->failed || !vm->kstr) return v;
+    v.as.o->rc++;            // the cache's own reference
+    vm->kstr[k] = v;
+    vm->nkstr++;
+    return v;
+}
 
 const char *sl_as_str(sl_value v, size_t *len_out) {
     if (v.type != SL_OBJ || !v.as.o || v.as.o->kind != SL_STR) {
@@ -228,11 +341,44 @@ sl_value sl_array(sl_vm *vm, int64_t cap) {
     a->head.rc = 1;
     a->head.kind = SL_ARRAY;
     a->len = 0;
-    a->cap = cap > 0 ? cap : 0;
-    a->items = a->cap ? (sl_value *)malloc(sizeof(sl_value) * (size_t)a->cap) : NULL;
-    if (a->cap && !a->items) { free(a); vm_error(vm, "out of memory"); return sl_void(); }
+    a->cap = cap > 0 ? cap : 0;      // storage is allocated by the first element
+    a->data = NULL;
+    a->ek = AK_NONE;
     vm->live++;
     return obj_value(&a->head);
+}
+
+// Switch to tagged storage.
+static bool arr_generify(sl_vm *vm, sl_arr *a) {
+    if (a->ek == AK_GEN) return true;
+    int64_t cap = a->cap > a->len ? a->cap : (a->len ? a->len : 1);
+    sl_value *n = (sl_value *)malloc(sizeof(sl_value) * (size_t)cap);
+    if (!n) { vm_error(vm, "out of memory"); return false; }
+    for (int64_t i = 0; i < a->len; i++) vstore(&n[i], arr_get(a, i));
+    free(a->data);
+    a->data = n; a->cap = cap; a->ek = AK_GEN;
+    return true;
+}
+
+// Make room for one more element of `kind` (an AK_ value).
+static bool arr_room(sl_vm *vm, sl_arr *a, int kind) {
+    if (a->ek == AK_NONE) {
+        a->ek = (uint8_t)kind;
+        int64_t cap = a->cap > 0 ? a->cap : 8;
+        a->data = malloc(ak_size(kind) * (size_t)cap);
+        if (!a->data) { a->ek = AK_NONE; vm_error(vm, "out of memory"); return false; }
+        a->cap = cap;
+        return true;
+    }
+    if (a->ek != kind && a->ek != AK_GEN && !arr_generify(vm, a)) return false;
+    if (a->len == a->cap) {
+        int64_t cap = a->cap < 8 ? 8 : a->cap * 2;
+        void *n = realloc(a->data, ak_size(a->ek) * (size_t)cap);
+        if (!n) { vm_error(vm, "out of memory"); return false; }
+        a->data = n;
+        a->cap = cap;
+    }
+    return true;
 }
 
 bool sl_array_push(sl_vm *vm, sl_value arr, sl_value item) {
@@ -252,7 +398,7 @@ int64_t sl_array_len(sl_value v) {
 sl_value sl_array_get(sl_value v, int64_t i) {
     sl_arr *a = (sl_arr *)v.as.o;
     if (!a || i < 0 || i >= a->len) return sl_void();
-    return a->items[i];
+    return arr_get(a, i);
 }
 
 bool sl_array_set(sl_vm *vm, sl_value arr, int64_t i, sl_value item) {
@@ -268,8 +414,10 @@ bool sl_array_set(sl_vm *vm, sl_value arr, int64_t i, sl_value item) {
                  (long long)i, (long long)a->len);
         return false;
     }
-    sl_release(vm, a->items[i]);
-    a->items[i] = item;
+    if (a->ek != AK_GEN && a->ek != ak_of(item) && !arr_generify(vm, a)) { sl_release(vm, item); return false; }
+    sl_value old = arr_get(a, i);
+    arr_put(a, i, item);
+    sl_release(vm, old);
     return true;
 }
 
@@ -283,7 +431,7 @@ bool sl_array_pop(sl_vm *vm, sl_value arr, sl_value *out) {
         vm_error(vm, "pop on an empty array");
         return false;
     }
-    *out = a->items[--a->len];
+    *out = arr_get(a, --a->len);
     return true;
 }
 
@@ -298,8 +446,9 @@ bool sl_array_remove(sl_vm *vm, sl_value arr, int64_t i, sl_value *out) {
                  (long long)i, (long long)a->len);
         return false;
     }
-    *out = a->items[i];
-    for (int64_t k = i; k < a->len - 1; k++) a->items[k] = a->items[k + 1];
+    *out = arr_get(a, i);
+    size_t sz = ak_size(a->ek);
+    memmove((char *)a->data + (size_t)i * sz, (char *)a->data + (size_t)(i + 1) * sz, (size_t)(a->len - i - 1) * sz);
     a->len--;
     return true;
 }
@@ -317,13 +466,101 @@ bool sl_array_insert(sl_vm *vm, sl_value arr, int64_t i, sl_value item) {
                  (long long)i, (long long)a->len);
         return false;
     }
-    if (!array_push(vm, a, sl_void())) return false;
-    for (int64_t k = a->len - 1; k > i; k--) a->items[k] = a->items[k - 1];
-    a->items[i] = item;
+    if (!arr_room(vm, a, ak_of(item))) { sl_release(vm, item); return false; }
+    size_t sz = ak_size(a->ek);
+    memmove((char *)a->data + (size_t)(i + 1) * sz, (char *)a->data + (size_t)i * sz, (size_t)(a->len - i) * sz);
+    a->len++;
+    arr_put(a, i, item);
     return true;
 }
 
 static bool sl_value_eq(sl_value a, sl_value b);
+
+// Maps up to this size are scanned; past it, lookups go through `index`.
+#define MAP_SCAN_MAX 8
+
+static uint64_t mix64(uint64_t x) {
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+// Equal keys must hash equal: see sl_value_eq. Keys that are never equal to
+// anything (structs, arrays) can hash to anything.
+static uint64_t map_hash(sl_value k) {
+    switch (k.type) {
+        case SL_INT:   return mix64((uint64_t)k.as.i);
+        case SL_FLOAT: {
+            if (k.as.f == 0) return mix64(0);       // -0.0 == 0.0
+            uint64_t bits;
+            memcpy(&bits, &k.as.f, sizeof bits);
+            return mix64(bits ^ 0x9e3779b97f4a7c15ULL);
+        }
+        case SL_BOOL:  return mix64((uint64_t)(k.as.b ? 1 : 2) + 0x1234567ULL);
+        case SL_OBJ: {
+            if (!k.as.o) return mix64(0xdeadbeefULL);
+            if (k.as.o->kind != SL_STR) return 0;
+            const sl_string *st = (const sl_string *)k.as.o;
+            uint64_t h = 1469598103934665603ULL;     // FNV-1a
+            for (size_t i = 0; i < st->len; i++) h = (h ^ (uint8_t)st->bytes[i]) * 1099511628211ULL;
+            return mix64(h);
+        }
+        default: return 0;
+    }
+}
+
+static void map_index_insert(sl_map_obj *mo, int64_t at) {
+    uint32_t mask = mo->index_cap - 1;
+    uint32_t slot = (uint32_t)mo->pairs[at].hash & mask;
+    while (mo->index[slot]) slot = (slot + 1) & mask;
+    mo->index[slot] = (uint32_t)at + 1;
+}
+
+// Rebuild the index from the pairs. False only if memory ran out, in which
+// case the map is still correct, just scanned.
+static bool map_reindex(sl_map_obj *mo) {
+    free(mo->index);
+    mo->index = NULL;
+    mo->index_cap = 0;
+    if (mo->len <= MAP_SCAN_MAX) return true;
+    uint32_t cap = 16;
+    while (cap < (uint64_t)mo->len * 2) cap <<= 1;
+    mo->index = (uint32_t *)calloc(cap, sizeof(uint32_t));
+    if (!mo->index) return false;
+    mo->index_cap = cap;
+    for (int64_t i = 0; i < mo->len; i++) map_index_insert(mo, i);
+    return true;
+}
+
+// Position of `key` in mo->pairs, or -1.
+static int64_t map_find(const sl_map_obj *mo, sl_value key, uint64_t h) {
+    if (key.type == SL_INT) {            // the common case, without the generic comparison
+        int64_t k = key.as.i;
+        if (mo->index) {
+            uint32_t mask = mo->index_cap - 1;
+            for (uint32_t slot = (uint32_t)h & mask; mo->index[slot]; slot = (slot + 1) & mask) {
+                const map_pair *p = &mo->pairs[mo->index[slot] - 1];
+                if (p->key.type == SL_INT && p->key.as.i == k) return mo->index[slot] - 1;
+            }
+            return -1;
+        }
+        for (int64_t i = 0; i < mo->len; i++)
+            if (mo->pairs[i].key.type == SL_INT && mo->pairs[i].key.as.i == k) return i;
+        return -1;
+    }
+    if (mo->index) {
+        uint32_t mask = mo->index_cap - 1;
+        for (uint32_t slot = (uint32_t)h & mask; mo->index[slot]; slot = (slot + 1) & mask) {
+            const map_pair *p = &mo->pairs[mo->index[slot] - 1];
+            if (p->hash == h && sl_value_eq(p->key, key)) return mo->index[slot] - 1;
+        }
+        return -1;
+    }
+    for (int64_t i = 0; i < mo->len; i++)
+        if (mo->pairs[i].hash == h && sl_value_eq(mo->pairs[i].key, key)) return i;
+    return -1;
+}
 
 sl_value sl_map(sl_vm *vm, int64_t cap) {
     sl_map_obj *m = (sl_map_obj *)malloc(sizeof(sl_map_obj));
@@ -332,6 +569,8 @@ sl_value sl_map(sl_vm *vm, int64_t cap) {
     m->head.kind = SL_MAP;
     m->len = 0;
     m->cap = cap > 0 ? cap : 0;
+    m->index = NULL;
+    m->index_cap = 0;
     m->pairs = m->cap ? (map_pair *)malloc(sizeof(map_pair) * (size_t)m->cap) : NULL;
     if (m->cap && !m->pairs) { free(m); vm_error(vm, "out of memory"); return sl_void(); }
     vm->live++;
@@ -346,12 +585,10 @@ int64_t sl_map_len(sl_value v) {
 bool sl_map_get(sl_value m, sl_value key, sl_value *out) {
     if (m.type != SL_OBJ || !m.as.o || m.as.o->kind != SL_MAP) return false;
     sl_map_obj *mo = (sl_map_obj *)m.as.o;
-    for (int64_t i = 0; i < mo->len; i++) {
-        if (!sl_value_eq(mo->pairs[i].key, key)) continue;
-        *out = mo->pairs[i].val;
-        return true;
-    }
-    return false;
+    int64_t i = map_find(mo, key, map_hash(key));
+    if (i < 0) return false;
+    *out = mo->pairs[i].val;
+    return true;
 }
 
 bool sl_map_set(sl_vm *vm, sl_value m, sl_value key, sl_value val) {
@@ -362,10 +599,11 @@ bool sl_map_set(sl_vm *vm, sl_value m, sl_value key, sl_value val) {
         return false;
     }
     sl_map_obj *mo = (sl_map_obj *)m.as.o;
-    for (int64_t i = 0; i < mo->len; i++) {
-        if (!sl_value_eq(mo->pairs[i].key, key)) continue;
-        sl_release(vm, mo->pairs[i].val);
-        mo->pairs[i].val = val;
+    uint64_t h = map_hash(key);
+    int64_t found = map_find(mo, key, h);
+    if (found >= 0) {
+        sl_release(vm, mo->pairs[found].val);
+        mo->pairs[found].val = val;
         sl_release(vm, key);   // an equal key is already stored; this one is spare
         return true;
     }
@@ -378,22 +616,24 @@ bool sl_map_set(sl_vm *vm, sl_value m, sl_value key, sl_value val) {
     }
     mo->pairs[mo->len].key = key;
     mo->pairs[mo->len].val = val;
+    mo->pairs[mo->len].hash = h;
     mo->len++;
+    if (mo->index && (uint64_t)mo->len * 2 <= mo->index_cap) map_index_insert(mo, mo->len - 1);
+    else if (mo->len > MAP_SCAN_MAX) map_reindex(mo);
     return true;
 }
 
 bool sl_map_remove(sl_vm *vm, sl_value m, sl_value key, sl_value *out) {
     if (m.type != SL_OBJ || !m.as.o || m.as.o->kind != SL_MAP) return false;
     sl_map_obj *mo = (sl_map_obj *)m.as.o;
-    for (int64_t i = 0; i < mo->len; i++) {
-        if (!sl_value_eq(mo->pairs[i].key, key)) continue;
-        *out = mo->pairs[i].val;
-        sl_release(vm, mo->pairs[i].key);
-        for (int64_t k = i; k < mo->len - 1; k++) mo->pairs[k] = mo->pairs[k + 1];
-        mo->len--;
-        return true;
-    }
-    return false;
+    int64_t i = map_find(mo, key, map_hash(key));
+    if (i < 0) return false;
+    *out = mo->pairs[i].val;
+    sl_release(vm, mo->pairs[i].key);
+    for (int64_t k = i; k < mo->len - 1; k++) mo->pairs[k] = mo->pairs[k + 1];
+    mo->len--;
+    map_reindex(mo);
+    return true;
 }
 
 bool sl_map_pair_at(sl_value m, int64_t i, sl_value *key_out, sl_value *val_out) {
@@ -407,14 +647,10 @@ bool sl_map_pair_at(sl_value m, int64_t i, sl_value *key_out, sl_value *val_out)
 
 // Takes ownership of `item`.
 static bool array_push(sl_vm *vm, sl_arr *a, sl_value item) {
-    if (a->len == a->cap) {
-        int64_t cap = a->cap < 8 ? 8 : a->cap * 2;
-        sl_value *n = (sl_value *)realloc(a->items, sizeof(sl_value) * (size_t)cap);
-        if (!n) { vm_error(vm, "out of memory"); return false; }
-        a->items = n;
-        a->cap = cap;
+    if (a->ek == AK_NONE || a->len == a->cap || a->ek != ak_of(item)) {
+        if (!arr_room(vm, a, ak_of(item))) { sl_release(vm, item); return false; }
     }
-    a->items[a->len++] = item;
+    arr_put(a, a->len++, item);
     return true;
 }
 
@@ -427,12 +663,15 @@ static sl_value struct_copy(sl_vm *vm, sl_value v) {
     }
     sl_struct *src = (sl_struct *)v.as.o;
     uint16_t n = src->nfields;
-    sl_struct *dst = (sl_struct *)malloc(sizeof(sl_struct) + (n ? n - 1 : 0) * sizeof(sl_value));
+    sl_struct *dst = struct_alloc(vm, n);
     if (!dst) { vm_error(vm, "out of memory"); return sl_void(); }
     dst->head.rc = 1;
     dst->head.kind = SL_STRUCT;
     dst->nfields = n;
-    for (uint16_t i = 0; i < n; i++) dst->fields[i] = struct_copy(vm, src->fields[i]);
+    for (uint16_t i = 0; i < n; i++) {
+        sl_value f = vload(&src->fields[i]);
+        vstore(&dst->fields[i], f.type == SL_OBJ ? struct_copy(vm, f) : f);
+    }
     vm->live++;
     return obj_value(&dst->head);
 }
@@ -496,7 +735,7 @@ static void render(sl_vm *vm, sl_value v, char **buf, size_t *len, size_t *cap) 
             append(buf, len, cap, "[", 1);
             for (int64_t i = 0; i < a->len; i++) {
                 if (i) append(buf, len, cap, ", ", 2);
-                render(vm, a->items[i], buf, len, cap);
+                render(vm, arr_get(a, i), buf, len, cap);
             }
             append(buf, len, cap, "]", 1);
             return;
@@ -811,7 +1050,7 @@ void sl_free(sl_vm *vm) {
     for (uint16_t i = 0; i < vm->nconsts; i++)
         if (vm->consts[i].type == C_STR) free(vm->consts[i].as.s.p);
     free(vm->consts);
-    for (uint16_t i = 0; i < vm->nfuncs; i++) { free(vm->funcs[i].name); free(vm->funcs[i].code); }
+    for (uint16_t i = 0; i < vm->nfuncs; i++) { free(vm->funcs[i].name); free(vm->funcs[i].code); free(vm->funcs[i].rcode); }
     free(vm->funcs);
     for (uint16_t i = 0; i < vm->nglobals; i++) sl_release(vm, vm->globals[i]);
     free(vm->globals);
@@ -822,6 +1061,13 @@ void sl_free(sl_vm *vm) {
     free(vm->native_names);
     free(vm->native_sigs);
     free(vm->native_bind);
+    if (vm->kstr) {
+        for (uint16_t i = 0; i < vm->nconsts; i++) if (vm->kstr[i].type == SL_OBJ) sl_release(vm, vm->kstr[i]);
+        free(vm->kstr);
+    }
+    free(vm->struct_desc);
+    for (int n = 0; n <= SL_POOL_FIELDS; n++)
+        while (vm->free_struct[n]) { void *next = *(void **)vm->free_struct[n]; free(vm->free_struct[n]); vm->free_struct[n] = next; }
     for (int i = 0; i < vm->nregistered; i++) { free(vm->registry[i].name); free(vm->registry[i].sig); }
     free(vm);
 }
@@ -987,6 +1233,981 @@ static bool sig_equal(const char *a, const char *b) {
 }
 
 // reports every unresolved or mismatched native, not just the first
+// ---------------------------------------------------------------------------
+// Register code
+//
+// The image holds stack code (compiler/emit.h). sl_load translates every
+// function once into the form below and sl_run executes that. A function's
+// frame is a run of registers: its locals first, then temporaries that stand
+// in for the stack positions of the original code. Every operand is a 16-bit
+// register number or immediate.
+//
+// Ownership: a register holding a heap value owns one reference. Dead
+// registers hold void or a scalar, never a stale heap pointer, so releasing a
+// whole frame (return, fault) is a plain scan. An instruction that consumes a
+// heap value out of a register sets it to void.
+// ---------------------------------------------------------------------------
+
+enum {
+    R_LDI, R_LDC_I, R_LDC_F, R_LDS, R_LDB, R_LDNULL,
+    R_MOV, R_MOVS, R_STORE, R_STORE_L, R_DROP,
+    R_ADD_I, R_SUB_I, R_MUL_I, R_DIV_I, R_REM_I, R_ADDI, R_NEG_I,
+    R_ADD_F, R_SUB_F, R_MUL_F, R_DIV_F, R_REM_F, R_NEG_F,
+    R_EQ_I, R_NE_I, R_LT_I, R_LE_I, R_GT_I, R_GE_I,
+    R_EQ_F, R_NE_F, R_LT_F, R_LE_F, R_GT_F, R_GE_F,
+    R_EQ_B, R_NE_B, R_NOT, R_EQ_S, R_NE_S,
+    R_CONCAT, R_STR_I, R_STR_F, R_STR_B, R_STR_OBJ,
+    R_JMP, R_JT, R_JF,
+    // Compare-and-branch: the jump is taken when the comparison holds (JC),
+    // or when it does not (JN, floats only: not the same thing, because NaN).
+    R_JC_EQ_I, R_JC_NE_I, R_JC_LT_I, R_JC_LE_I, R_JC_GT_I, R_JC_GE_I,
+    R_JC_EQ_F, R_JC_NE_F, R_JC_LT_F, R_JC_LE_F, R_JC_GT_F, R_JC_GE_F,
+    R_JN_EQ_F, R_JN_NE_F, R_JN_LT_F, R_JN_LE_F, R_JN_GT_F, R_JN_GE_F,
+    R_JCI_EQ, R_JCI_NE, R_JCI_LT, R_JCI_LE, R_JCI_GT, R_JCI_GE,
+    R_CALL, R_NATIVE, R_RET, R_RETV, R_HALT,
+    // The _L forms read a local register without consuming it; the others
+    // consume a temporary.
+    R_NEWARR, R_AGET, R_AGET_L, R_ASET, R_ASET_L, R_ALEN, R_ALEN_L,
+    R_APUSH, R_APUSH_L, R_SLICE,
+    R_NEWSTRUCT, R_FGET, R_FGET_L, R_FSET, R_FSET_L,
+    R_NEWVAR, R_VTAG, R_VGET,
+    R_LOADG, R_STOREG, R_COPY, R_NEWMAP, R_MGET, R_MSET,
+    // x += step, then jump if x < limit (a register, or an immediate for the I form)
+    R_AJLT, R_AJLTI,
+    // jump if x < len(a)
+    R_JLTLEN,
+    // interpreter-only fusions (the C emitter works from the plain forms)
+    R_MOV2, R_MOV3, R_AGET_S, R_ASET_LC, R_APUSH_LC,
+    // the same array accesses with the bounds check proved away by the optimizer
+    R_AGET_LU, R_ASET_LU, R_AGET_SU, R_ASET_LCU,
+    R_COUNT
+};
+
+typedef enum { E_TEMP, E_LOCAL, E_IMM, E_CMP } ekind;
+
+// What a stack position holds while translating. Locals, immediates and
+// comparisons stay lazy until something needs them in a register.
+typedef struct {
+    uint8_t  kind;
+    bool     scalar;      // E_TEMP: known to hold an int, float or bool
+    bool     is_float;    // E_CMP
+    bool     b_imm;       // E_CMP: right-hand side is `b`, an immediate
+    uint8_t  cmp;         // E_CMP: 0..5 = EQ NE LT LE GT GE
+    uint16_t reg;         // E_LOCAL: slot. E_CMP: left operand
+    int32_t  b;           // E_IMM: value. E_CMP: right operand
+} tent;
+
+typedef struct { size_t at; int target; } tfix;
+
+#define TX_MAX_HOIST 24
+
+typedef struct {
+    sl_vm   *vm;
+    const uint8_t *in;
+    size_t   n;
+    uint16_t *out;
+    size_t   nout, cap;
+    tent    *st;
+    int      depth, maxdepth;
+    uint16_t nslots;
+    int     *newpos, *depth_at;
+    uint8_t *is_target;
+    tfix    *fix;
+    int      nfix;
+    bool    *obj_slot;    // slots that may hold a heap value
+    // Constants that sit inside a loop are loaded once, on entry, into
+    // registers after the locals, and read from there afterwards.
+    uint64_t *kbits;      // shared by both passes
+    uint8_t  *kfloat;
+    int      *nk;
+    uint16_t tbase;       // first temporary: nslots plus one register per hoisted constant
+    uint8_t  *in_loop;
+    bool     direct;      // second pass: obj_slot is final, write scalars in place
+    bool     reachable;
+    bool     last_def_valid;
+    size_t   last_def_pos, last_def_end;
+    size_t   ins_start;          // where the current stack instruction began emitting
+    size_t   last_aget_at;       // start of the last AGET_L, to fold a following STORE into it
+    int      last_def_depth;
+    bool     bad;
+} tx;
+
+#define TREG(t, d) ((uint16_t)((t)->tbase + (d)))
+
+static int stack_op_len(uint8_t op) {
+    switch (op) {
+        case OP_TRUE: case OP_FALSE: case OP_POP: case OP_DUP: case OP_CONCAT:
+        case OP_ADD_I: case OP_SUB_I: case OP_MUL_I: case OP_DIV_I: case OP_REM_I: case OP_NEG_I:
+        case OP_STR_I: case OP_STR_F: case OP_STR_B: case OP_STR_OBJ:
+        case OP_ADD_F: case OP_SUB_F: case OP_MUL_F: case OP_DIV_F: case OP_REM_F: case OP_NEG_F:
+        case OP_EQ_I: case OP_NE_I: case OP_LT_I: case OP_LE_I: case OP_GT_I: case OP_GE_I:
+        case OP_EQ_F: case OP_NE_F: case OP_LT_F: case OP_LE_F: case OP_GT_F: case OP_GE_F:
+        case OP_EQ_S: case OP_NE_S: case OP_EQ_B: case OP_NE_B: case OP_NOT:
+        case OP_RET: case OP_RET_VOID: case OP_HALT:
+        case OP_AGET: case OP_ASET: case OP_ALEN: case OP_APUSH: case OP_VTAG:
+        case OP_DUP2: case OP_NULL: case OP_SLICE: case OP_MGET: case OP_MSET:
+            return 1;
+        case OP_CONST_I8: case OP_LOAD: case OP_STORE: case OP_FGET: case OP_FSET: case OP_VGET:
+            return 2;
+        case OP_CONST: case OP_CONST_STR: case OP_JUMP: case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE:
+        case OP_NEW_ARRAY: case OP_NEW_MAP: case OP_LOADG: case OP_STOREG:
+        case OP_INCR_I: case OP_MOVE: case OP_COPY:
+            return 3;
+        case OP_NEW_VARIANT: case OP_ADD_RR_I:
+            return 4;
+        case OP_CALL: case OP_NATIVE: case OP_NEW_STRUCT:
+            return 5;
+        default:
+            return 0;
+    }
+}
+
+static void tx_word(tx *t, uint16_t w) {
+    if (t->nout == t->cap) {
+        size_t cap = t->cap ? t->cap * 2 : 256;
+        uint16_t *o = (uint16_t *)realloc(t->out, cap * sizeof *o);
+        if (!o) { t->bad = true; return; }
+        t->out = o; t->cap = cap;
+    }
+    t->out[t->nout++] = w;
+}
+
+// Append one instruction (operands end at the -1 sentinel); returns the index
+// of its first word. Anything that is not a scalar definition invalidates the
+// "last definition" record.
+static size_t tx_emitv(tx *t, ...) {
+    size_t at = t->nout;
+    va_list ap;
+    va_start(ap, t);
+    for (int w = va_arg(ap, int); w != -1; w = va_arg(ap, int)) tx_word(t, (uint16_t)w);
+    va_end(ap);
+    t->last_def_valid = false;
+    return at;
+}
+#define EMIT(t, ...) tx_emitv((t), __VA_ARGS__, -1)
+
+// Record that the instruction at `at` just defined a scalar into the register
+// at word `dst_word`, standing for stack position `depth`.
+static void tx_def(tx *t, size_t dst_word, int depth) {
+    t->last_def_valid = true;
+    t->last_def_pos = dst_word;
+    t->last_def_depth = depth;
+    t->last_def_end = t->nout;
+}
+
+// Registers T(0) .. T(count-1) are in use.
+static void tx_need(tx *t, int count) { if (count > t->maxdepth) t->maxdepth = count; }
+
+static void tx_materialize(tx *t, int k) {
+    tent *e = &t->st[k];
+    uint16_t dst = TREG(t, k);
+    switch (e->kind) {
+        case E_TEMP: return;
+        case E_LOCAL:
+            tx_need(t, k + 1);
+#ifndef SL_AOT_EMITTER
+            // Argument setup is a run of copies: one instruction for two or three of them.
+            if (t->nout >= t->ins_start + 3 && t->nout >= 3 && t->out[t->nout - 3] == R_MOV) {
+                t->out[t->nout - 3] = R_MOV2;
+                tx_word(t, dst); tx_word(t, e->reg);
+                t->last_def_valid = false;
+                e->kind = E_TEMP; e->scalar = false;
+                return;
+            }
+            if (t->nout >= t->ins_start + 5 && t->nout >= 5 && t->out[t->nout - 5] == R_MOV2) {
+                t->out[t->nout - 5] = R_MOV3;
+                tx_word(t, dst); tx_word(t, e->reg);
+                t->last_def_valid = false;
+                e->kind = E_TEMP; e->scalar = false;
+                return;
+            }
+#endif
+            EMIT(t, R_MOV, dst, e->reg);
+            e->kind = E_TEMP; e->scalar = false;
+            return;
+        case E_IMM: {
+            tx_need(t, k + 1);
+            size_t at = EMIT(t, R_LDI, dst, (uint16_t)(int16_t)e->b);
+            tx_def(t, at + 1, k);
+            e->kind = E_TEMP; e->scalar = true;
+            return;
+        }
+        case E_CMP: {
+            uint16_t rb;
+            if (e->b_imm) {
+                tx_need(t, k + 2);
+                rb = TREG(t, k + 1);
+                EMIT(t, R_LDI, rb, (uint16_t)(int16_t)e->b);
+            } else {
+                rb = (uint16_t)e->b;
+            }
+            tx_need(t, k + 1);
+            size_t at = EMIT(t, (e->is_float ? R_EQ_F : R_EQ_I) + e->cmp, dst, e->reg, rb);
+            tx_def(t, at + 1, k);
+            e->kind = E_TEMP; e->scalar = true;
+            return;
+        }
+    }
+}
+
+static void tx_flush(tx *t, int upto) { for (int k = 0; k < upto; k++) tx_materialize(t, k); }
+
+// The register to read stack position k from as a scalar.
+static uint16_t tx_sreg(tx *t, int k) {
+    tent *e = &t->st[k];
+    if (e->kind == E_LOCAL) return e->reg;
+    tx_materialize(t, k);
+    return TREG(t, k);
+}
+
+static void tx_push(tx *t, tent e) {
+    if (t->depth + 1 >= (int)(t->n + 8)) { t->bad = true; return; }
+    t->st[t->depth++] = e;
+    tx_need(t, t->depth);
+}
+static uint16_t tx_push_temp(tx *t, bool scalar) {
+    tent e; memset(&e, 0, sizeof e);
+    e.kind = E_TEMP; e.scalar = scalar;
+    uint16_t r = TREG(t, t->depth);
+    tx_push(t, e);
+    return r;
+}
+
+// Make `s` safe to overwrite: any lazy reference to it is copied out first.
+// Returns true if that emitted code.
+static bool tx_invalidate(tx *t, uint16_t s) {
+    bool emitted = false;
+    for (int k = 0; k < t->depth; k++)
+        if (t->st[k].kind == E_LOCAL && t->st[k].reg == s) { tx_materialize(t, k); emitted = true; }
+    return emitted;
+}
+
+static void tx_jump_fix(tx *t, size_t at, int target_off) {
+    if (!t->fix) { t->bad = true; return; }
+    t->fix[t->nfix].at = at;
+    t->fix[t->nfix].target = target_off;
+    t->nfix++;
+}
+
+static const uint8_t cmp_inverse[6] = { 1, 0, 5, 4, 3, 2 };
+
+// Length in words of a register instruction that is safe to copy: no jump, no
+// side effect beyond writing its destination register. 0 for anything else.
+static int tx_copyable_len(uint16_t op) {
+    switch (op) {
+        case R_LDI: case R_MOVS: case R_ALEN_L: return 3;
+        case R_ADDI: case R_AGET_L: return 4;
+        case R_LDC_I: case R_LDC_F: return 6;
+        default: return 0;
+    }
+}
+
+// If the code at `target` (a loop head) is a few simple instructions and then
+// one conditional branch that leaves the loop to `exit_off`, copy them to the
+// bottom with the branch inverted and aimed at the loop body. Returns false and
+// emits nothing if the shape is not that.
+static bool tx_invert_loop(tx *t, int target, int exit_off) {
+    size_t head = (size_t)t->newpos[target];
+    size_t pos = head;
+    while (pos < t->nout && tx_copyable_len(t->out[pos]) && pos - head < 12) pos += (size_t)tx_copyable_len(t->out[pos]);
+    if (pos >= t->nout) return false;
+    uint16_t op = t->out[pos];
+    int len;
+    if (op == R_JT || op == R_JF) len = 3;
+    else if ((op >= R_JC_EQ_I && op <= R_JN_GE_F) || (op >= R_JCI_EQ && op <= R_JCI_GE)) len = 4;
+    else return false;
+    if (pos + (size_t)len > t->nout) return false;
+    // no other entry into the middle of that block, and its jump must be the loop exit
+    for (size_t k = head + 1; k <= pos; k++) {
+        bool inner = false;
+        for (int tg = 0; tg <= (int)t->n; tg++) if (t->newpos[tg] == (int)k && t->is_target[tg]) inner = true;
+        if (inner) return false;
+    }
+    bool exits = false;
+    for (int i = 0; i < t->nfix; i++)
+        if (t->fix[i].at == pos + (size_t)len - 1 && t->fix[i].target == exit_off) exits = true;
+    if (!exits) return false;
+    if (t->is_target[exit_off - 3]) return false;       // something else lands on this jump
+
+    uint16_t inv;
+    if (op == R_JT) inv = R_JF;
+    else if (op == R_JF) inv = R_JT;
+    else if (op >= R_JC_EQ_I && op <= R_JC_GE_I) inv = (uint16_t)(R_JC_EQ_I + cmp_inverse[op - R_JC_EQ_I]);
+    else if (op >= R_JC_EQ_F && op <= R_JC_GE_F) inv = (uint16_t)(R_JN_EQ_F + (op - R_JC_EQ_F));
+    else if (op >= R_JN_EQ_F && op <= R_JN_GE_F) inv = (uint16_t)(R_JC_EQ_F + (op - R_JN_EQ_F));
+    else inv = (uint16_t)(R_JCI_EQ + cmp_inverse[op - R_JCI_EQ]);
+
+    size_t body = pos + (size_t)len;
+    // `x += k` right before a `<` test of x fuses into one instruction
+    if (pos == head && (inv == R_JC_LT_I || inv == R_JCI_LT) && t->nout >= 4 && t->out[t->nout - 4] == R_ADDI &&
+        t->out[t->nout - 3] == t->out[t->nout - 2] && t->out[t->nout - 3] == t->out[pos + 1]) {
+        uint16_t x = t->out[pos + 1], step = t->out[t->nout - 1], lim = t->out[pos + 2];
+        t->nout -= 4;
+        size_t at = t->nout;
+        tx_word(t, inv == R_JC_LT_I ? R_AJLT : R_AJLTI);
+        tx_word(t, x); tx_word(t, lim); tx_word(t, step);
+        tx_word(t, (uint16_t)(int16_t)((long)body - (long)(at + 5)));
+        t->last_def_valid = false;
+        return true;
+    }
+    // `i < len(a)`: the length read and the test are one instruction
+    if (pos == head + 3 && t->out[head] == R_ALEN_L && inv == R_JC_LT_I && t->out[pos + 2] == t->out[head + 1] &&
+        t->out[pos + 1] != t->out[head + 1]) {
+        size_t at = t->nout;
+        tx_word(t, R_JLTLEN);
+        tx_word(t, t->out[pos + 1]);
+        tx_word(t, t->out[head + 2]);
+        tx_word(t, (uint16_t)(int16_t)((long)body - (long)(at + 4)));
+        t->last_def_valid = false;
+        return true;
+    }
+    for (size_t k = head; k < pos; k++) tx_word(t, t->out[k]);      // the simple instructions
+    size_t at = t->nout;
+    tx_word(t, inv);
+    for (int k = 1; k < len - 1; k++) tx_word(t, t->out[pos + (size_t)k]);
+    tx_word(t, (uint16_t)(int16_t)((long)body - (long)(at + (size_t)len)));
+    t->last_def_valid = false;
+    return true;
+}
+
+// Translate one function. Run twice: the first pass only discovers which
+// slots can hold heap values, so the second can write scalars straight into
+// the rest.
+static bool translate_pass(sl_vm *vm, sl_func *f, bool *obj_slot, bool direct, tx *t,
+                           uint64_t *kbits, uint8_t *kfloat, int *nk) {
+    memset(t, 0, sizeof *t);
+    t->kbits = kbits; t->kfloat = kfloat; t->nk = nk;
+    t->tbase = (uint16_t)(f->nslots + (direct ? *nk : 0));
+    t->vm = vm; t->in = f->code; t->n = f->code_len;
+    t->nslots = f->nslots; t->obj_slot = obj_slot; t->direct = direct;
+    size_t n = f->code_len;
+    t->st = (tent *)calloc(n + 16, sizeof(tent));
+    t->newpos = (int *)malloc((n + 1) * sizeof(int));
+    t->depth_at = (int *)malloc((n + 1) * sizeof(int));
+    t->is_target = (uint8_t *)calloc(n + 1, 1);
+    t->in_loop = (uint8_t *)calloc(n + 1, 1);
+    t->fix = (tfix *)malloc((n + 1) * sizeof(tfix));
+    if (!t->st || !t->newpos || !t->depth_at || !t->is_target || !t->in_loop || !t->fix) { t->bad = true; return false; }
+    for (size_t i = 0; i <= n; i++) { t->newpos[i] = -1; t->depth_at[i] = -1; }
+
+    // Jump targets.
+    for (size_t at = 0; at < n;) {
+        int len = stack_op_len(f->code[at]);
+        if (!len || at + (size_t)len > n) { t->bad = true; return false; }
+        uint8_t op = f->code[at];
+        if (op == OP_JUMP || op == OP_JUMP_IF_FALSE || op == OP_JUMP_IF_TRUE) {
+            int16_t d = (int16_t)((uint16_t)f->code[at + 1] | ((uint16_t)f->code[at + 2] << 8));
+            long tgt = (long)at + 3 + d;
+            if (tgt < 0 || tgt > (long)n) { t->bad = true; return false; }
+            t->is_target[tgt] = 1;
+            if (tgt <= (long)at)      // a backward jump closes a loop
+                for (long k = tgt; k <= (long)at; k++) t->in_loop[k] = 1;
+        }
+        at += (size_t)len;
+    }
+
+    t->reachable = true;
+    if (direct) {
+        for (int k = 0; k < *nk; k++) {
+            uint64_t u = kbits[k];
+            EMIT(t, kfloat[k] ? R_LDC_F : R_LDC_I, (uint16_t)(t->nslots + k),
+                 (uint16_t)u, (uint16_t)(u >> 16), (uint16_t)(u >> 32), (uint16_t)(u >> 48));
+        }
+    }
+    for (size_t off = 0; off < n && !t->bad;) {
+        const uint8_t *p = f->code + off;
+        uint8_t op = p[0];
+        int len = stack_op_len(op);
+
+        if (t->is_target[off]) {
+            if (t->reachable) {
+                tx_flush(t, t->depth);
+            } else {
+                t->depth = t->depth_at[off] >= 0 ? t->depth_at[off] : 0;
+                for (int k = 0; k < t->depth; k++) {
+                    memset(&t->st[k], 0, sizeof(tent));
+                    t->st[k].kind = E_TEMP;
+                }
+                tx_need(t, t->depth);
+            }
+            t->newpos[off] = (int)t->nout;
+            t->reachable = true;
+            t->last_def_valid = false;
+        } else if (!t->reachable) {
+            off += (size_t)len;
+            continue;
+        }
+
+        t->ins_start = t->nout;
+
+        // A comparison waits for a branch to fuse with; anything else needs it as a value.
+        if (t->depth > 0 && t->st[t->depth - 1].kind == E_CMP &&
+            op != OP_JUMP_IF_FALSE && op != OP_JUMP_IF_TRUE)
+            tx_materialize(t, t->depth - 1);
+
+#define NEED(k) do { if (t->depth < (k)) { t->bad = true; goto out; } } while (0)
+#define TOP (t->depth - 1)
+        switch (op) {
+        case OP_CONST_I8: {
+            tent e; memset(&e, 0, sizeof e);
+            e.kind = E_IMM; e.b = (int8_t)p[1];
+            tx_push(t, e);
+            break;
+        }
+        case OP_CONST: {
+            uint16_t i = (uint16_t)(p[1] | (p[2] << 8));
+            if (i >= vm->nconsts || vm->consts[i].type == C_STR) { t->bad = true; goto out; }
+            bool is_int = vm->consts[i].type == C_INT;
+            uint64_t u;
+            if (is_int) u = (uint64_t)vm->consts[i].as.i;
+            else memcpy(&u, &vm->consts[i].as.f, sizeof u);
+            if (is_int) {
+                int64_t v = vm->consts[i].as.i;
+                if (v >= -32768 && v <= 32767) {
+                    tent e; memset(&e, 0, sizeof e);
+                    e.kind = E_IMM; e.b = (int32_t)v;
+                    tx_push(t, e);
+                    break;
+                }
+            }
+            if (t->in_loop[off]) {
+                int idx = -1;
+                for (int k = 0; k < *t->nk; k++)
+                    if (t->kbits[k] == u && t->kfloat[k] == !is_int) { idx = k; break; }
+                if (idx < 0 && *t->nk < TX_MAX_HOIST) {
+                    idx = (*t->nk)++;
+                    t->kbits[idx] = u; t->kfloat[idx] = !is_int;
+                }
+                if (idx >= 0) {
+                    tent e; memset(&e, 0, sizeof e);
+                    e.kind = E_LOCAL; e.reg = (uint16_t)(t->nslots + idx);
+                    tx_push(t, e);
+                    break;
+                }
+            }
+            uint16_t r = tx_push_temp(t, true);
+            size_t at = EMIT(t, is_int ? R_LDC_I : R_LDC_F, r, (uint16_t)u, (uint16_t)(u >> 16), (uint16_t)(u >> 32), (uint16_t)(u >> 48));
+            tx_def(t, at + 1, t->depth - 1);
+            break;
+        }
+        case OP_CONST_STR: {
+            uint16_t i = (uint16_t)(p[1] | (p[2] << 8));
+            if (i >= vm->nconsts || vm->consts[i].type != C_STR) { t->bad = true; goto out; }
+            uint16_t r = tx_push_temp(t, false);
+            EMIT(t, R_LDS, r, i);
+            break;
+        }
+        case OP_TRUE: case OP_FALSE: {
+            uint16_t r = tx_push_temp(t, true);
+            size_t at = EMIT(t, R_LDB, r, op == OP_TRUE ? 1 : 0);
+            tx_def(t, at + 1, t->depth - 1);
+            break;
+        }
+        case OP_NULL: {
+            uint16_t r = tx_push_temp(t, false);
+            EMIT(t, R_LDNULL, r);
+            break;
+        }
+        case OP_POP: {
+            NEED(1);
+            tent e = t->st[TOP];
+            t->depth--;
+            if (e.kind == E_TEMP && !e.scalar) EMIT(t, R_DROP, TREG(t, t->depth));
+            break;
+        }
+        case OP_LOAD: {
+            tent e; memset(&e, 0, sizeof e);
+            e.kind = E_LOCAL; e.reg = p[1];
+            tx_push(t, e);
+            break;
+        }
+        case OP_DUP: {
+            NEED(1);
+            tent e = t->st[TOP];
+            if (e.kind == E_TEMP) {
+                uint16_t r = tx_push_temp(t, e.scalar);
+                EMIT(t, R_MOV, r, TREG(t, t->depth - 2));
+            } else {
+                tx_push(t, e);
+            }
+            break;
+        }
+        case OP_DUP2: {
+            NEED(2);
+            tent a = t->st[t->depth - 2], b = t->st[t->depth - 1];
+            for (int i = 0; i < 2; i++) {
+                tent e = i ? b : a;
+                if (e.kind == E_TEMP) {
+                    uint16_t src = TREG(t, t->depth - 2);
+                    uint16_t r = tx_push_temp(t, e.scalar);
+                    EMIT(t, R_MOV, r, src);
+                } else {
+                    tx_push(t, e);
+                }
+            }
+            break;
+        }
+        case OP_STORE: {
+            NEED(1);
+            uint16_t s = p[1];
+            if (s >= t->nslots) { t->bad = true; goto out; }
+            tent e = t->st[TOP];
+            t->depth--;
+            tx_invalidate(t, s);
+            bool hoisted = e.kind == E_LOCAL && e.reg >= t->nslots;      // a loop-invariant constant
+            bool scalar_known = e.kind == E_IMM || e.kind == E_CMP || hoisted || (e.kind == E_TEMP && e.scalar);
+            if (!scalar_known) t->obj_slot[s] = true;
+            uint16_t tr = TREG(t, t->depth);
+            if (t->direct && !t->obj_slot[s]) {
+                // The slot only ever holds scalars: write it without releasing.
+                if (e.kind == E_IMM) {
+                    EMIT(t, R_LDI, s, (uint16_t)(int16_t)e.b);
+                } else if (hoisted) {
+                    EMIT(t, R_MOVS, s, e.reg);
+                } else {
+                    if (e.kind == E_CMP) {
+                        t->st[t->depth] = e; t->depth++;
+                        tx_materialize(t, t->depth - 1);
+                        t->depth--;
+                    }
+                    if (t->last_def_valid && t->last_def_depth == t->depth && t->last_def_end == t->nout) {
+                        t->out[t->last_def_pos] = s;      // retarget the instruction that just defined it
+                        t->last_def_valid = false;
+                    } else {
+                        EMIT(t, R_MOVS, s, tr);
+                    }
+                }
+            } else if (e.kind == E_LOCAL) {
+                EMIT(t, R_STORE_L, s, e.reg);
+            } else {
+                t->st[t->depth] = e; t->depth++;
+                tx_materialize(t, t->depth - 1);
+                t->depth--;
+#ifndef SL_AOT_EMITTER
+                // `let x = a[i]`: read the element straight into the variable
+                if (t->nout >= 4 && t->last_aget_at == t->nout - 4 && t->out[t->nout - 4] == R_AGET_L &&
+                    t->out[t->nout - 3] == tr) {
+                    uint16_t arr = t->out[t->nout - 2], idx = t->out[t->nout - 1];
+                    t->nout -= 4;
+                    EMIT(t, R_AGET_S, s, arr, idx);
+                    break;
+                }
+#endif
+                EMIT(t, R_STORE, s, tr);
+            }
+            break;
+        }
+        case OP_INCR_I: {
+            uint16_t s = p[1];
+            if (s >= t->nslots) { t->bad = true; goto out; }
+            tx_invalidate(t, s);
+            EMIT(t, R_ADDI, s, s, (uint16_t)(int16_t)(int8_t)p[2]);
+            break;
+        }
+        case OP_MOVE: {
+            uint16_t dst = p[1], src = p[2];
+            if (dst >= t->nslots || src >= t->nslots) { t->bad = true; goto out; }
+            tx_invalidate(t, dst);
+            EMIT(t, R_MOVS, dst, src);
+            break;
+        }
+        case OP_ADD_RR_I: {
+            uint16_t dst = p[1], s1 = p[2], s2 = p[3];
+            if (dst >= t->nslots || s1 >= t->nslots || s2 >= t->nslots) { t->bad = true; goto out; }
+            tx_invalidate(t, dst);
+            EMIT(t, R_ADD_I, dst, s1, s2);
+            break;
+        }
+
+        case OP_ADD_I: case OP_SUB_I: case OP_MUL_I: case OP_DIV_I: case OP_REM_I: {
+            NEED(2);
+            int a = t->depth - 2, b = t->depth - 1;
+            bool is_add = op == OP_ADD_I, is_sub = op == OP_SUB_I;
+            tent A = t->st[a], B = t->st[b];
+            uint16_t dst = TREG(t, a);
+            size_t at;
+            if ((is_add || is_sub) && B.kind == E_IMM && (is_sub ? -B.b : B.b) >= -32768 && (is_sub ? -B.b : B.b) <= 32767) {
+                uint16_t ra = tx_sreg(t, a);
+                at = EMIT(t, R_ADDI, dst, ra, (uint16_t)(int16_t)(is_sub ? -B.b : B.b));
+            } else if (is_add && A.kind == E_IMM) {
+                uint16_t rb = tx_sreg(t, b);
+                at = EMIT(t, R_ADDI, dst, rb, (uint16_t)(int16_t)A.b);
+            } else {
+                uint16_t ra = tx_sreg(t, a), rb = tx_sreg(t, b);
+                at = EMIT(t, R_ADD_I + (op - OP_ADD_I), dst, ra, rb);
+            }
+            t->depth--;
+            t->st[a].kind = E_TEMP; t->st[a].scalar = true;
+            tx_def(t, at + 1, a);
+            break;
+        }
+        case OP_ADD_F: case OP_SUB_F: case OP_MUL_F: case OP_DIV_F: case OP_REM_F:
+        case OP_EQ_B: case OP_NE_B: {
+            NEED(2);
+            int a = t->depth - 2, b = t->depth - 1;
+            uint16_t ra = tx_sreg(t, a), rb = tx_sreg(t, b);
+            uint16_t rop = op >= OP_ADD_F && op <= OP_REM_F ? (uint16_t)(R_ADD_F + (op - OP_ADD_F))
+                                                           : (uint16_t)(R_EQ_B + (op - OP_EQ_B));
+            size_t at = EMIT(t, rop, TREG(t, a), ra, rb);
+            t->depth--;
+            t->st[a].kind = E_TEMP; t->st[a].scalar = true;
+            tx_def(t, at + 1, a);
+            break;
+        }
+        case OP_NEG_I: case OP_NEG_F: case OP_NOT: {
+            NEED(1);
+            uint16_t ra = tx_sreg(t, TOP);
+            uint16_t rop = op == OP_NEG_I ? R_NEG_I : op == OP_NEG_F ? R_NEG_F : R_NOT;
+            size_t at = EMIT(t, rop, TREG(t, TOP), ra);
+            t->st[TOP].kind = E_TEMP; t->st[TOP].scalar = true;
+            tx_def(t, at + 1, TOP);
+            break;
+        }
+        case OP_EQ_I: case OP_NE_I: case OP_LT_I: case OP_LE_I: case OP_GT_I: case OP_GE_I: {
+            NEED(2);
+            int a = t->depth - 2, b = t->depth - 1;
+            tent A = t->st[a], B = t->st[b];
+            tent c; memset(&c, 0, sizeof c);
+            c.kind = E_CMP; c.cmp = (uint8_t)(op - OP_EQ_I);
+            if (A.kind == E_IMM) tx_materialize(t, a);
+            c.reg = tx_sreg(t, a);
+            if (B.kind == E_IMM) { c.b_imm = true; c.b = B.b; }
+            else c.b = tx_sreg(t, b);
+            t->depth--;
+            t->st[a] = c;
+            break;
+        }
+        case OP_EQ_F: case OP_NE_F: case OP_LT_F: case OP_LE_F: case OP_GT_F: case OP_GE_F: {
+            NEED(2);
+            int a = t->depth - 2, b = t->depth - 1;
+            tent c; memset(&c, 0, sizeof c);
+            c.kind = E_CMP; c.is_float = true; c.cmp = (uint8_t)(op - OP_EQ_F);
+            c.reg = tx_sreg(t, a);
+            c.b = tx_sreg(t, b);
+            t->depth--;
+            t->st[a] = c;
+            break;
+        }
+
+        case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: {
+            NEED(1);
+            bool when_true = op == OP_JUMP_IF_TRUE;
+            tent c = t->st[TOP];
+            t->depth--;
+            tx_flush(t, t->depth);
+            int16_t d = (int16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
+            int target = (int)off + 3 + d;
+            size_t at;
+            if (c.kind == E_CMP) {
+                if (c.b_imm) {
+                    uint8_t cm = when_true ? c.cmp : cmp_inverse[c.cmp];
+                    at = EMIT(t, R_JCI_EQ + cm, c.reg, (uint16_t)(int16_t)c.b, 0);
+                } else if (!c.is_float) {
+                    uint8_t cm = when_true ? c.cmp : cmp_inverse[c.cmp];
+                    at = EMIT(t, R_JC_EQ_I + cm, c.reg, (uint16_t)c.b, 0);
+                } else if (when_true) {
+                    at = EMIT(t, R_JC_EQ_F + c.cmp, c.reg, (uint16_t)c.b, 0);
+                } else {
+                    at = EMIT(t, R_JN_EQ_F + c.cmp, c.reg, (uint16_t)c.b, 0);
+                }
+                (void)at;
+                tx_jump_fix(t, t->nout - 1, target);
+            } else {
+                uint16_t r;
+                if (c.kind == E_LOCAL) r = c.reg;
+                else { t->st[t->depth] = c; t->depth++; r = tx_sreg(t, t->depth - 1); t->depth--; }
+                EMIT(t, when_true ? R_JT : R_JF, r, 0);
+                tx_jump_fix(t, t->nout - 1, target);
+            }
+            if (target <= (int)n && t->depth_at[target] < 0) t->depth_at[target] = t->depth;
+            break;
+        }
+        case OP_JUMP: {
+            tx_flush(t, t->depth);
+            int16_t d = (int16_t)((uint16_t)p[1] | ((uint16_t)p[2] << 8));
+            int target = (int)off + 3 + d;
+            // A loop whose condition is a single branch at the top is closed with
+            // the opposite branch at the bottom instead of a jump back to the top:
+            // one dispatch per iteration less.
+            if (target <= (int)off && t->newpos[target] >= 0 && tx_invert_loop(t, target, (int)off + 3)) {
+                if (target <= (int)n && t->depth_at[off + 3] < 0) t->depth_at[off + 3] = t->depth;
+                break;
+            }
+            EMIT(t, R_JMP, 0);
+            tx_jump_fix(t, t->nout - 1, target);
+            if (target <= (int)n && t->depth_at[target] < 0) t->depth_at[target] = t->depth;
+            t->reachable = false;
+            break;
+        }
+
+        case OP_CONCAT: case OP_EQ_S: case OP_NE_S: {
+            NEED(2);
+            int a = t->depth - 2, b = t->depth - 1;
+            tx_materialize(t, a); tx_materialize(t, b);
+            uint16_t rop = op == OP_CONCAT ? R_CONCAT : op == OP_EQ_S ? R_EQ_S : R_NE_S;
+            EMIT(t, rop, TREG(t, a), TREG(t, a), TREG(t, b));
+            t->depth--;
+            t->st[a].kind = E_TEMP; t->st[a].scalar = op != OP_CONCAT;
+            break;
+        }
+        case OP_STR_I: case OP_STR_F: case OP_STR_B: {
+            NEED(1);
+            uint16_t ra = tx_sreg(t, TOP);
+            EMIT(t, R_STR_I + (op - OP_STR_I), TREG(t, TOP), ra);
+            t->st[TOP].kind = E_TEMP; t->st[TOP].scalar = false;
+            break;
+        }
+        case OP_STR_OBJ: {
+            NEED(1);
+            tx_materialize(t, TOP);
+            EMIT(t, R_STR_OBJ, TREG(t, TOP), TREG(t, TOP));
+            t->st[TOP].scalar = false;
+            break;
+        }
+
+        case OP_CALL: case OP_NATIVE: {
+            uint16_t id = (uint16_t)(p[1] | (p[2] << 8));
+            int argc = p[3];
+            bool nres = p[4] != 0;
+            NEED(argc);
+            if (op == OP_CALL && id >= vm->nfuncs) { t->bad = true; goto out; }
+            if (op == OP_NATIVE && id >= vm->nnative_names) { t->bad = true; goto out; }
+            int first = t->depth - argc;
+            for (int k = first; k < t->depth; k++) tx_materialize(t, k);
+            uint16_t base = TREG(t, first);
+            if (op == OP_CALL) EMIT(t, R_CALL, id, base);
+            else EMIT(t, R_NATIVE, id, base, (uint16_t)argc, nres ? 1 : 0);
+            t->depth = first;
+            if (nres) tx_push_temp(t, false);
+            break;
+        }
+        case OP_RET: {
+            NEED(1);
+            // The frame is about to die, so a local can be handed over as it is.
+            if (t->st[TOP].kind == E_LOCAL) {
+                EMIT(t, R_RET, t->st[TOP].reg);
+            } else {
+                tx_materialize(t, TOP);
+                EMIT(t, R_RET, TREG(t, TOP));
+            }
+            t->reachable = false;
+            break;
+        }
+        case OP_RET_VOID: EMIT(t, R_RETV); t->reachable = false; break;
+        case OP_HALT:     EMIT(t, R_HALT); t->reachable = false; break;
+
+        case OP_NEW_ARRAY: case OP_NEW_STRUCT: case OP_NEW_MAP: case OP_NEW_VARIANT: {
+            uint16_t cnt, tag = 0;
+            if (op == OP_NEW_VARIANT) { tag = (uint16_t)(p[1] | (p[2] << 8)); cnt = p[3]; }
+            else cnt = (uint16_t)(p[1] | (p[2] << 8));
+            uint16_t tid = op == OP_NEW_STRUCT ? (uint16_t)(p[3] | (p[4] << 8)) : 0;
+            int items = op == OP_NEW_MAP ? 2 * cnt : cnt;
+            NEED(items);
+            int first = t->depth - items;
+            for (int k = first; k < t->depth; k++) tx_materialize(t, k);
+            uint16_t base = TREG(t, first);
+            switch (op) {
+                case OP_NEW_ARRAY:   EMIT(t, R_NEWARR, base, cnt); break;
+                case OP_NEW_STRUCT:  EMIT(t, R_NEWSTRUCT, base, cnt, tid); break;
+                case OP_NEW_MAP:     EMIT(t, R_NEWMAP, base, cnt); break;
+                default:             EMIT(t, R_NEWVAR, base, tag, cnt); break;
+            }
+            t->depth = first;
+            tx_push_temp(t, false);
+            break;
+        }
+
+        case OP_AGET: {
+            NEED(2);
+            int a = t->depth - 2, b = t->depth - 1;
+            uint16_t ri = tx_sreg(t, b);
+            if (t->st[a].kind == E_LOCAL) {
+                t->last_aget_at = EMIT(t, R_AGET_L, TREG(t, a), t->st[a].reg, ri);
+            } else {
+                tx_materialize(t, a);
+                EMIT(t, R_AGET, TREG(t, a), TREG(t, a), ri);
+            }
+            t->depth--;
+            t->st[a].kind = E_TEMP; t->st[a].scalar = false;
+            break;
+        }
+        case OP_ASET: {
+            NEED(3);
+            int a = t->depth - 3, i = t->depth - 2, v = t->depth - 1;
+#ifndef SL_AOT_EMITTER
+            if (t->st[v].kind == E_LOCAL && t->st[a].kind == E_LOCAL) {
+                uint16_t ri2 = tx_sreg(t, i);
+                EMIT(t, R_ASET_LC, t->st[a].reg, ri2, t->st[v].reg);
+                t->depth -= 3;
+                break;
+            }
+#endif
+            tx_materialize(t, v);
+            uint16_t ri = tx_sreg(t, i);
+            if (t->st[a].kind == E_LOCAL) EMIT(t, R_ASET_L, t->st[a].reg, ri, TREG(t, v));
+            else { tx_materialize(t, a); EMIT(t, R_ASET, TREG(t, a), ri, TREG(t, v)); }
+            t->depth -= 3;
+            break;
+        }
+        case OP_ALEN: {
+            NEED(1);
+            if (t->st[TOP].kind == E_LOCAL) EMIT(t, R_ALEN_L, TREG(t, TOP), t->st[TOP].reg);
+            else { tx_materialize(t, TOP); EMIT(t, R_ALEN, TREG(t, TOP), TREG(t, TOP)); }
+            t->st[TOP].kind = E_TEMP; t->st[TOP].scalar = true;
+            break;
+        }
+        case OP_APUSH: {
+            NEED(2);
+            int a = t->depth - 2, v = t->depth - 1;
+#ifndef SL_AOT_EMITTER
+            if (t->st[v].kind == E_LOCAL && t->st[a].kind == E_LOCAL) {
+                EMIT(t, R_APUSH_LC, t->st[a].reg, t->st[v].reg);
+                t->depth -= 2;
+                break;
+            }
+#endif
+            tx_materialize(t, v);
+            if (t->st[a].kind == E_LOCAL) EMIT(t, R_APUSH_L, t->st[a].reg, TREG(t, v));
+            else { tx_materialize(t, a); EMIT(t, R_APUSH, TREG(t, a), TREG(t, v)); }
+            t->depth -= 2;
+            break;
+        }
+        case OP_SLICE: {
+            NEED(3);
+            int a = t->depth - 3, lo = t->depth - 2, hi = t->depth - 1;
+            tx_materialize(t, a);
+            uint16_t rl = tx_sreg(t, lo), rh = tx_sreg(t, hi);
+            EMIT(t, R_SLICE, TREG(t, a), TREG(t, a), rl, rh);
+            t->depth -= 2;
+            t->st[a].kind = E_TEMP; t->st[a].scalar = false;
+            break;
+        }
+        case OP_FGET: {
+            NEED(1);
+            uint16_t idx = p[1];
+            if (t->st[TOP].kind == E_LOCAL) EMIT(t, R_FGET_L, TREG(t, TOP), t->st[TOP].reg, idx);
+            else { tx_materialize(t, TOP); EMIT(t, R_FGET, TREG(t, TOP), TREG(t, TOP), idx); }
+            t->st[TOP].kind = E_TEMP; t->st[TOP].scalar = false;
+            break;
+        }
+        case OP_FSET: {
+            NEED(2);
+            uint16_t idx = p[1];
+            int a = t->depth - 2, v = t->depth - 1;
+            tx_materialize(t, v);
+            if (t->st[a].kind == E_LOCAL) EMIT(t, R_FSET_L, t->st[a].reg, idx, TREG(t, v));
+            else { tx_materialize(t, a); EMIT(t, R_FSET, TREG(t, a), idx, TREG(t, v)); }
+            t->depth -= 2;
+            break;
+        }
+        case OP_VTAG: {
+            NEED(1);
+            tx_materialize(t, TOP);
+            EMIT(t, R_VTAG, TREG(t, TOP), TREG(t, TOP));
+            t->st[TOP].scalar = true;
+            break;
+        }
+        case OP_VGET: {
+            NEED(1);
+            tx_materialize(t, TOP);
+            EMIT(t, R_VGET, TREG(t, TOP), TREG(t, TOP), p[1]);
+            t->st[TOP].scalar = false;
+            break;
+        }
+        case OP_COPY: {
+            NEED(1);
+            tx_materialize(t, TOP);
+            EMIT(t, R_COPY, TREG(t, TOP), TREG(t, TOP), (uint16_t)(p[1] | (p[2] << 8)));
+            t->st[TOP].scalar = false;
+            break;
+        }
+        case OP_LOADG: {
+            uint16_t g = (uint16_t)(p[1] | (p[2] << 8));
+            if (g >= vm->nglobals) { t->bad = true; goto out; }
+            uint16_t r = tx_push_temp(t, false);
+            EMIT(t, R_LOADG, r, g);
+            break;
+        }
+        case OP_STOREG: {
+            NEED(1);
+            uint16_t g = (uint16_t)(p[1] | (p[2] << 8));
+            if (g >= vm->nglobals) { t->bad = true; goto out; }
+            tx_materialize(t, TOP);
+            EMIT(t, R_STOREG, g, TREG(t, TOP));
+            t->depth--;
+            break;
+        }
+        case OP_MGET: {
+            NEED(2);
+            int a = t->depth - 2, b = t->depth - 1;
+            tx_materialize(t, a); tx_materialize(t, b);
+            EMIT(t, R_MGET, TREG(t, a), TREG(t, a), TREG(t, b));
+            t->depth--;
+            t->st[a].kind = E_TEMP; t->st[a].scalar = false;
+            break;
+        }
+        case OP_MSET: {
+            NEED(3);
+            int a = t->depth - 3;
+            tx_materialize(t, a); tx_materialize(t, a + 1); tx_materialize(t, a + 2);
+            EMIT(t, R_MSET, TREG(t, a), TREG(t, a + 1), TREG(t, a + 2));
+            t->depth -= 3;
+            break;
+        }
+        default:
+            t->bad = true;
+            goto out;
+        }
+#undef NEED
+#undef TOP
+        off += (size_t)len;
+    }
+    if (t->is_target[n]) {
+        if (t->reachable) tx_flush(t, t->depth);
+        t->newpos[n] = (int)t->nout;
+    }
+out:
+    return !t->bad;
+}
+
+static void tx_free(tx *t) {
+    free(t->st); free(t->newpos); free(t->depth_at); free(t->is_target); free(t->in_loop); free(t->fix);
+}
+
+#include "opt.inc"
+
+static bool translate_function(sl_vm *vm, sl_func *f) {
+    size_t nslots = (size_t)f->nslots + 1;
+    bool *obj_slot = (bool *)calloc(nslots, sizeof(bool));
+    if (!obj_slot) return false;
+    tx t;
+    uint64_t kbits[TX_MAX_HOIST];
+    uint8_t kfloat[TX_MAX_HOIST];
+    int nk = 0;
+    bool ok = translate_pass(vm, f, obj_slot, false, &t, kbits, kfloat, &nk);
+    if (ok) {
+        free(t.out); tx_free(&t);
+        ok = translate_pass(vm, f, obj_slot, true, &t, kbits, kfloat, &nk);
+    }
+    free(obj_slot);
+    if (!ok) { free(t.out); tx_free(&t); return false; }
+
+    for (int i = 0; i < t.nfix; i++) {
+        int tgt = t.newpos[t.fix[i].target];
+        if (tgt < 0) { ok = false; break; }
+        long rel = (long)tgt - (long)(t.fix[i].at + 1);
+        if (rel < -32768 || rel > 32767) { ok = false; break; }
+        t.out[t.fix[i].at] = (uint16_t)(int16_t)rel;
+    }
+    long nregs = (long)t.tbase + t.maxdepth;
+    if (!ok || nregs > 60000) { free(t.out); tx_free(&t); return false; }
+    f->rcode = t.out;
+    f->rlen = (uint32_t)t.nout;
+    f->nregs = (uint16_t)nregs;
+    tx_free(&t);
+    return true;
+}
+
 static sl_result link_check(sl_vm *vm) {
     enum { SHOWN = 6 };
     int problems = 0;
@@ -1024,9 +2245,16 @@ sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
         return SL_ERR_BADFILE;
     }
     r.p += 4;
+    // A VM may load another image. The shared string constants belong to the old one.
+    if (vm->kstr) {
+        for (uint16_t i = 0; i < vm->nconsts; i++) if (vm->kstr[i].type == SL_OBJ) sl_release(vm, vm->kstr[i]);
+        free(vm->kstr);
+        vm->kstr = NULL;
+        vm->nkstr = 0;
+    }
     uint16_t version = rd_u16(&r);
-    if (version != 6) {
-        vm_error(vm, "bytecode version %u, this runtime understands 6", version);
+    if (version != 9) {
+        vm_error(vm, "bytecode version %u, this runtime understands 9", version);
         return SL_ERR_BADFILE;
     }
 
@@ -1062,6 +2290,15 @@ sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
         vm->native_bind[i] = -1;
     }
 
+    vm->nstructs = rd_u16(&r);
+    vm->struct_desc = (uint8_t (*)[33])calloc(vm->nstructs ? vm->nstructs : 1, 33);
+    if (!vm->struct_desc) return SL_ERR_NOMEM;
+    for (uint16_t i = 0; i < vm->nstructs && !r.bad; i++) {
+        uint8_t n = rd_u8(&r);
+        vm->struct_desc[i][0] = n;
+        for (uint8_t k = 0; k < n && k < 32; k++) vm->struct_desc[i][1 + k] = rd_u8(&r);
+    }
+
     // Globals start void; the image's entry function initialises them.
     vm->nglobals = rd_u16(&r);
     vm->globals = (sl_value *)calloc(vm->nglobals ? vm->nglobals : 1, sizeof(sl_value));
@@ -1090,6 +2327,16 @@ sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
     if (r.bad) { vm_error(vm, "bytecode image is truncated or corrupt"); return SL_ERR_BADFILE; }
     if (vm->entry >= vm->nfuncs) { vm_error(vm, "entry function out of range"); return SL_ERR_BADFILE; }
 
+    for (uint16_t i = 0; i < vm->nfuncs; i++) {
+        if (!translate_function(vm, &vm->funcs[i])) {
+            vm_error(vm, "function '%s' is malformed or too large", vm->funcs[i].name);
+            return SL_ERR_BADFILE;
+        }
+        free(vm->funcs[i].code);
+        vm->funcs[i].code = NULL;
+    }
+    for (uint16_t i = 0; i < vm->nfuncs; i++) opt_function(vm, &vm->funcs[i], i);
+
     // Last registration wins, so a host can shadow an intrinsic.
     for (uint16_t i = 0; i < vm->nnative_names; i++)
         for (int j = vm->nregistered - 1; j >= 0; j--)
@@ -1098,560 +2345,860 @@ sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
     return link_check(vm);
 }
 
-static int16_t read_i16(uint8_t **ip) {
-    int16_t v = (int16_t)((uint16_t)(*ip)[0] | ((uint16_t)(*ip)[1] << 8));
-    *ip += 2; return v;
+static inline void set_int(sl_value *p, int64_t v)  { p->type = SL_INT;   p->as.i = v; }
+static inline void set_flt(sl_value *p, double v)   { p->type = SL_FLOAT; p->as.f = v; }
+static inline void set_bool(sl_value *p, bool v)    { p->type = SL_BOOL;  p->as.i = v; }
+
+#if defined(__GNUC__)
+#define SL_NOINLINE __attribute__((noinline))
+#else
+#define SL_NOINLINE
+#endif
+
+// Kept out of line on purpose. If gcc vectorises this loop inside sl_run, its
+// constants end up in the shared dispatch block and gcc stops giving each
+// handler its own indirect jump.
+static SL_NOINLINE int64_t utf8_length(sl_value s) {
+    size_t bn;
+    const char *p = sl_as_str(s, &bn);
+    int64_t n = 0;
+    for (size_t k = 0; k < bn; k++) if ((p[k] & 0xC0) != 0x80) n++;
+    return n;
 }
-static uint16_t read_u16(uint8_t **ip) {
-    uint16_t v = (uint16_t)((*ip)[0]) | ((uint16_t)((*ip)[1]) << 8);
-    *ip += 2; return v;
+
+static sl_value str_of_int(sl_vm *vm, int64_t v) {
+    char tmp[24];
+    char *e = tmp + sizeof tmp, *p = e;
+    uint64_t u = v < 0 ? 0 - (uint64_t)v : (uint64_t)v;
+    do { *--p = (char)('0' + u % 10); u /= 10; } while (u);
+    if (v < 0) *--p = '-';
+    sl_string *s = str_alloc(vm, (size_t)(e - p));
+    if (!s) return sl_void();
+    memcpy(s->bytes, p, (size_t)(e - p));
+    return obj_value(&s->head);
 }
 
-#define PUSH(v) do { \
-        if (vm->sp >= vm->stack + SL_STACK_MAX) { vm_error(vm, "stack overflow"); goto fail; } \
-        *vm->sp++ = (v); \
-    } while (0)
-#define POP() (*(--vm->sp))
-#define RELEASE(v) do { sl_value _v = (v); if (_v.type == SL_OBJ) sl_release(vm, _v); } while (0)
+// Dropping a reference that is not the last one needs no call.
+static inline void rel(sl_vm *vm, sl_value v) {
+    if (v.type != SL_OBJ || !v.as.o) return;
+    if (v.as.o->rc > 1) v.as.o->rc--;
+    else sl_release(vm, v);
+}
+// Release a heap value held in a register and leave the register void.
+static inline void drop(sl_vm *vm, sl_value *p) {
+    if (p->type == SL_OBJ) { sl_value v = vload(p); p->type = SL_VOID; rel(vm, v); }
+}
+// The register's reference moved elsewhere.
+static inline void moved(sl_value *p) { if (p->type == SL_OBJ) p->type = SL_VOID; }
 
-sl_result sl_run(sl_vm *vm) {
-    if (vm->nfuncs == 0) { vm_error(vm, "nothing loaded"); return SL_ERR_RUNTIME; }
+// Release everything the stack still owns, up to `end`.
+static void release_stack(sl_vm *vm, sl_value *end) {
+    for (sl_value *p = vm->stack; p < end; p++) drop(vm, p);
+}
 
-    vm->sp = vm->stack;
-    vm->nframes = 0;
-    vm->failed = false;
-    vm->err[0] = 0;
+// Threaded dispatch: every handler ends in its own indirect jump, so the
+// branch predictor sees one site per opcode instead of one shared site.
+// Compilers without labels-as-values (or -DSL_NO_THREADED) get a plain switch.
+#if defined(__GNUC__) && !defined(SL_NO_THREADED) && !defined(__cplusplus)
+#define SL_THREADED 1
+// Labels-as-values and range designators are GNU extensions.
+#pragma GCC diagnostic ignored "-Wpedantic"
+#pragma GCC diagnostic ignored "-Woverride-init"
+#define OPC(name)  L_##name
+#define NEXT()     goto *dispatch[*ip++]
+#define SL_DISPATCH_BEGIN  NEXT(); {
+#define SL_DISPATCH_END    }
+#else
+#define OPC(name)  case name
+#define NEXT()     break
+#define SL_DISPATCH_BEGIN  for (;;) { switch (*ip++) {
+#define SL_DISPATCH_END    } }
+#endif
 
-    sl_func *fn = &vm->funcs[vm->entry];
-    sl_frame *fr = &vm->frames[vm->nframes++];
-    fr->fn = fn; fr->ip = fn->code; fr->slots = vm->sp;
-    for (uint16_t i = 0; i < fn->nslots; i++) *vm->sp++ = sl_void();
+#define RR(i)   R[ip[i]]
+#define IMM(i)  ((int16_t)ip[i])
+#define OFFSET(i) ((int16_t)ip[i])
 
-    uint8_t *ip = fr->ip;
-
-    for (;;) {
-        uint8_t op = *ip++;
-        switch (op) {
-
-        case OP_CONST_I8: PUSH(sl_int((int8_t)*ip++)); break;
-
-        case OP_CONST: {
-            uint16_t i = read_u16(&ip);
-            if (i >= vm->nconsts) { vm_error(vm, "bad constant index"); goto fail; }
-            sl_const *c = &vm->consts[i];
-            PUSH(c->type == C_INT ? sl_int(c->as.i) : sl_float(c->as.f));
-            break;
-        }
-
-        case OP_CONST_STR: {
-            uint16_t i = read_u16(&ip);
-            if (i >= vm->nconsts || vm->consts[i].type != C_STR) {
-                vm_error(vm, "bad string constant"); goto fail;
-            }
-            sl_value s = sl_str(vm, vm->consts[i].as.s.p, vm->consts[i].as.s.n);
-            if (vm->failed) goto fail;
-            PUSH(s);
-            break;
-        }
-
-        case OP_TRUE:  PUSH(sl_bool(true));  break;
-        case OP_FALSE: PUSH(sl_bool(false)); break;
-        case OP_POP:   RELEASE(POP()); break;
-
-        case OP_DUP: { sl_value v = vm->sp[-1]; sl_retain(v); PUSH(v); break; }
-
-        case OP_LOAD:  { uint8_t s = *ip++; sl_value v = fr->slots[s]; sl_retain(v); PUSH(v); break; }
-        case OP_STORE: {
-            uint8_t s = *ip++;
-            sl_value old = fr->slots[s];
-            fr->slots[s] = POP();      // the stack's reference moves into the slot
-            RELEASE(old);
-            break;
-        }
-
-        case OP_INCR_I: {
-            uint8_t s = *ip++;
-            int8_t imm = (int8_t)*ip++;
-            fr->slots[s].as.i += imm;
-            break;
-        }
-        case OP_MOVE: {
-            uint8_t dst = *ip++, src = *ip++;
-            fr->slots[dst] = fr->slots[src];
-            break;
-        }
-        case OP_ADD_RR_I: {
-            uint8_t dst = *ip++, s1 = *ip++, s2 = *ip++;
-            fr->slots[dst] = sl_int(fr->slots[s1].as.i + fr->slots[s2].as.i);
-            break;
-        }
-
-        case OP_CONCAT: {
-            sl_value b = POP(), a = POP();
+// Long handlers that are rarely hot live out of line, which keeps the hot
+// handlers small enough for the compiler to allocate registers well.
+static SL_NOINLINE bool opf_CONCAT(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value a = vload(&RR(1)), b = vload(&RR(2));
             size_t an, bn;
             const char *ap = sl_as_str(a, &an), *bp = sl_as_str(b, &bn);
-            char *joined = (char *)malloc(an + bn + 1);
-            if (!joined) { sl_release(vm, a); sl_release(vm, b); vm_error(vm, "out of memory"); goto fail; }
-            memcpy(joined, ap, an);
-            memcpy(joined + an, bp, bn);
-            sl_value out = sl_str(vm, joined, an + bn);
-            free(joined);
-            sl_release(vm, a); sl_release(vm, b);
-            if (vm->failed) goto fail;
-            PUSH(out);
-            break;
-        }
+            sl_string *joined = str_alloc(vm, an + bn);
+            if (!joined) return false;
+            memcpy(joined->bytes, ap, an);
+            memcpy(joined->bytes + an, bp, bn);
+            drop(vm, &RR(1)); drop(vm, &RR(2));
+            vstore(&RR(0), obj_value(&joined->head));
+    return true;
+}
 
-        // These trust the opcode, not the tag, the same way the arithmetic
-        // does. The type check already happened in the compiler. A backend
-        // that emits the wrong one gets visibly wrong output instead of being
-        // quietly rescued here.
-        case OP_STR_I: {
-            int64_t i = POP().as.i;
-            char tmp[32];
-            int n = snprintf(tmp, sizeof tmp, "%lld", (long long)i);
-            PUSH(sl_str(vm, tmp, n > 0 ? (size_t)n : 0));
-            break;
-        }
-
-        case OP_STR_F: {
-            double d = POP().as.f;
+static SL_NOINLINE bool opf_STR_F(sl_vm *vm, sl_value *R, uint16_t *ip) {
             char tmp[64];
-            fmt_float(tmp, sizeof tmp, d);
-            PUSH(sl_str(vm, tmp, strlen(tmp)));
-            break;
-        }
+            fmt_float(tmp, sizeof tmp, RR(1).as.f);
+            sl_value s = sl_str(vm, tmp, strlen(tmp));
+            if (vm->failed) return false;
+            vstore(&RR(0), s);
+    return true;
+}
 
-        case OP_STR_B: {
-            bool b = POP().as.b;
-            PUSH(b ? sl_str(vm, "true", 4) : sl_str(vm, "false", 5));
-            break;
-        }
+static SL_NOINLINE bool opf_STR_B(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value s = RR(1).as.b ? sl_str(vm, "true", 4) : sl_str(vm, "false", 5);
+            if (vm->failed) return false;
+            vstore(&RR(0), s);
+    return true;
+}
 
-        // The generic case: arrays, structs, enums. Rendering those is a
-        // structural walk whatever the static type says, so there's nothing to
-        // specialise. Only emitted for reference types.
-        case OP_STR_OBJ: {
-            sl_value v = POP();
+static SL_NOINLINE bool opf_STR_OBJ(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value v = vload(&RR(1));
             sl_value s = sl_to_string(vm, v);
-            sl_release(vm, v);
-            if (vm->failed) goto fail;
-            PUSH(s);
-            break;
-        }
+            drop(vm, &RR(1));
+            if (vm->failed) return false;
+            vstore(&RR(0), s);
+    return true;
+}
 
-        case OP_ADD_I: { int64_t b = POP().as.i, a = POP().as.i; PUSH(sl_int(a + b)); break; }
-        case OP_SUB_I: { int64_t b = POP().as.i, a = POP().as.i; PUSH(sl_int(a - b)); break; }
-        case OP_MUL_I: { int64_t b = POP().as.i, a = POP().as.i; PUSH(sl_int(a * b)); break; }
-        case OP_DIV_I: {
-            int64_t b = POP().as.i, a = POP().as.i;
-            if (b == 0) { vm_error(vm, "division by zero"); goto fail; }
-            PUSH(sl_int(a / b)); break;
-        }
-        case OP_REM_I: {
-            int64_t b = POP().as.i, a = POP().as.i;
-            if (b == 0) { vm_error(vm, "remainder by zero"); goto fail; }
-            PUSH(sl_int(a % b)); break;
-        }
-        case OP_NEG_I: { int64_t a = POP().as.i; PUSH(sl_int(-a)); break; }
+static SL_NOINLINE bool opf_STR_I(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value s = str_of_int(vm, RR(1).as.i);
+            if (vm->failed) return false;
+            vstore(&RR(0), s);
+    return true;
+}
 
-        case OP_ADD_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_float(a + b)); break; }
-        case OP_SUB_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_float(a - b)); break; }
-        case OP_MUL_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_float(a * b)); break; }
-        case OP_DIV_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_float(a / b)); break; }
-        case OP_REM_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_float(fmod(a, b))); break; }
-        case OP_NEG_F: { double a = POP().as.f; PUSH(sl_float(-a)); break; }
-
-        case OP_EQ_I: { int64_t b = POP().as.i, a = POP().as.i; PUSH(sl_bool(a == b)); break; }
-        case OP_NE_I: { int64_t b = POP().as.i, a = POP().as.i; PUSH(sl_bool(a != b)); break; }
-        case OP_LT_I: { int64_t b = POP().as.i, a = POP().as.i; PUSH(sl_bool(a <  b)); break; }
-        case OP_LE_I: { int64_t b = POP().as.i, a = POP().as.i; PUSH(sl_bool(a <= b)); break; }
-        case OP_GT_I: { int64_t b = POP().as.i, a = POP().as.i; PUSH(sl_bool(a >  b)); break; }
-        case OP_GE_I: { int64_t b = POP().as.i, a = POP().as.i; PUSH(sl_bool(a >= b)); break; }
-
-        case OP_EQ_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_bool(a == b)); break; }
-        case OP_NE_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_bool(a != b)); break; }
-        case OP_LT_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_bool(a <  b)); break; }
-        case OP_LE_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_bool(a <= b)); break; }
-        case OP_GT_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_bool(a >  b)); break; }
-        case OP_GE_F: { double b = POP().as.f, a = POP().as.f; PUSH(sl_bool(a >= b)); break; }
-
-        case OP_EQ_S: case OP_NE_S: {
-            sl_value b = POP(), a = POP();
-            size_t an, bn;
-            const char *ap = sl_as_str(a, &an), *bp = sl_as_str(b, &bn);
-            bool eq = (an == bn) && memcmp(ap, bp, an) == 0;
-            sl_release(vm, a); sl_release(vm, b);
-            PUSH(sl_bool(op == OP_EQ_S ? eq : !eq));
-            break;
-        }
-
-        case OP_EQ_B: { bool b = POP().as.b, a = POP().as.b; PUSH(sl_bool(a == b)); break; }
-        case OP_NE_B: { bool b = POP().as.b, a = POP().as.b; PUSH(sl_bool(a != b)); break; }
-        case OP_NOT:  { bool a = POP().as.b; PUSH(sl_bool(!a)); break; }
-
-        case OP_JUMP: { int16_t d = read_i16(&ip); ip += d; break; }
-        case OP_JUMP_IF_FALSE: {
-            int16_t d = read_i16(&ip);
-            if (!POP().as.b) ip += d;
-            break;
-        }
-
-        case OP_NEW_ARRAY: {
-            uint16_t n = read_u16(&ip);
-            sl_value av = sl_array(vm, n);
-            if (vm->failed) goto fail;
-            sl_arr *a = (sl_arr *)av.as.o;
-            // The elements are on the stack in order; move them in.
-            sl_value *base = vm->sp - n;
-            for (uint16_t i = 0; i < n; i++) {
-                if (!array_push(vm, a, base[i])) { sl_release(vm, av); goto fail; }
-            }
-            vm->sp = base;
-            PUSH(av);
-            break;
-        }
-
-        case OP_AGET: {
-            sl_value iv = POP(), av = POP();
-            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) {
-                sl_release(vm, av); vm_error(vm, "not an array"); goto fail;
-            }
-            sl_arr *a = (sl_arr *)av.as.o;
-            int64_t i = iv.as.i;
-            if (i < 0) i += a->len;
-            if (i < 0 || i >= a->len) {
-                vm_error(vm, "index %lld is out of bounds for an array of length %lld",
-                         (long long)iv.as.i, (long long)a->len);
-                sl_release(vm, av); goto fail;
-            }
-            sl_value e = a->items[i];
-            sl_retain(e);
-            sl_release(vm, av);
-            PUSH(e);
-            break;
-        }
-
-        case OP_ASET: {
-            sl_value val = POP(), iv = POP(), av = POP();
-            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) {
-                sl_release(vm, val); sl_release(vm, av);
-                vm_error(vm, "not an array"); goto fail;
-            }
-            sl_arr *a = (sl_arr *)av.as.o;
-            int64_t i = iv.as.i;
-            if (i < 0) i += a->len;
-            if (i < 0 || i >= a->len) {
-                vm_error(vm, "index %lld is out of bounds for an array of length %lld",
-                         (long long)iv.as.i, (long long)a->len);
-                sl_release(vm, val); sl_release(vm, av); goto fail;
-            }
-            sl_release(vm, a->items[i]);
-            a->items[i] = val;          // ownership moves into the array
-            sl_release(vm, av);
-            break;
-        }
-
-        case OP_SLICE: {
-            sl_value hv = POP(), lv = POP(), av = POP();
-            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) {
-                sl_release(vm, av); vm_error(vm, "not an array"); goto fail;
-            }
+static SL_NOINLINE bool opf_SLICE(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value av = vload(&RR(1));
+            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) { vm_error(vm, "not an array"); return false; }
             sl_arr *a = (sl_arr *)av.as.o;
             int64_t n = a->len;
-            int64_t lo = lv.as.i, hi = hv.as.i;
+            int64_t lo = RR(2).as.i, hi = RR(3).as.i, lo0 = lo, hi0 = hi;
             if (lo < 0) lo += n;
             if (hi < 0) hi += n;
             if (lo < 0 || hi > n || lo > hi) {
                 vm_error(vm, "slice [%lld:%lld] is out of bounds for an array of length %lld",
-                         (long long)lv.as.i, (long long)hv.as.i, (long long)n);
-                sl_release(vm, av); goto fail;
+                         (long long)lo0, (long long)hi0, (long long)n);
+                return false;
             }
             sl_value out = sl_array(vm, hi - lo);
-            if (vm->failed) { sl_release(vm, av); goto fail; }
+            if (vm->failed) return false;
             sl_arr *oa = (sl_arr *)out.as.o;
             for (int64_t k = lo; k < hi; k++) {
-                sl_value item = a->items[k];
+                sl_value item = arr_get(a, k);
                 sl_retain(item);
-                if (!array_push(vm, oa, item)) {
-                    sl_release(vm, item); sl_release(vm, out); sl_release(vm, av);
-                    goto fail;
-                }
+                if (!array_push(vm, oa, item)) { rel(vm, out); return false; }
             }
-            sl_release(vm, av);
-            PUSH(out);
-            break;
-        }
+            drop(vm, &RR(1));
+            vstore(&RR(0), out);
+    return true;
+}
 
-        case OP_NEW_MAP: {
-            uint16_t n = read_u16(&ip);
-            sl_value mv = sl_map(vm, n);
-            if (vm->failed) goto fail;
-            sl_value *base = vm->sp - 2 * n;
-            for (uint16_t i = 0; i < n; i++) {
-                if (!sl_map_set(vm, mv, base[2 * i], base[2 * i + 1])) {
-                    sl_release(vm, mv); goto fail;
-                }
-            }
-            vm->sp = base;
-            PUSH(mv);
-            break;
-        }
-
-        case OP_MGET: {
-            sl_value kv = POP(), mv = POP();
-            if (mv.type != SL_OBJ || !mv.as.o || mv.as.o->kind != SL_MAP) {
-                sl_release(vm, kv); sl_release(vm, mv); vm_error(vm, "not a map"); goto fail;
-            }
-            sl_value out;
-            if (!sl_map_get(mv, kv, &out)) {
-                sl_release(vm, kv); sl_release(vm, mv); vm_error(vm, "key not found"); goto fail;
-            }
-            sl_retain(out);
-            sl_release(vm, kv);
-            sl_release(vm, mv);
-            PUSH(out);
-            break;
-        }
-
-        case OP_MSET: {
-            sl_value val = POP(), kv = POP(), mv = POP();
-            if (mv.type != SL_OBJ || !mv.as.o || mv.as.o->kind != SL_MAP) {
-                sl_release(vm, val); sl_release(vm, kv); sl_release(vm, mv);
-                vm_error(vm, "not a map"); goto fail;
-            }
-            if (!sl_map_set(vm, mv, kv, val)) { sl_release(vm, mv); goto fail; }
-            sl_release(vm, mv);
-            break;
-        }
-
-        case OP_ALEN: {
-            sl_value av = POP();
-            int64_t n;
-            if (av.type == SL_OBJ && av.as.o && av.as.o->kind == SL_STR) {
-                // len() on a string counts UTF-8 characters, not bytes.
-                size_t bn; const char *p = sl_as_str(av, &bn);
-                n = 0;
-                for (size_t k = 0; k < bn; k++) if ((p[k] & 0xC0) != 0x80) n++;
-            } else if (av.type == SL_OBJ && av.as.o && av.as.o->kind == SL_MAP) {
-                n = sl_map_len(av);
-            } else {
-                n = sl_array_len(av);
-            }
-            sl_release(vm, av);
-            PUSH(sl_int(n));
-            break;
-        }
-
-        case OP_APUSH: {
-            sl_value val = POP(), av = POP();
-            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) {
-                sl_release(vm, val); sl_release(vm, av);
-                vm_error(vm, "not an array"); goto fail;
-            }
-            if (!array_push(vm, (sl_arr *)av.as.o, val)) { sl_release(vm, av); goto fail; }
-            sl_release(vm, av);
-            break;
-        }
-
-        case OP_NEW_STRUCT: {
-            uint16_t n = read_u16(&ip);
-            sl_struct *s = (sl_struct *)malloc(sizeof(sl_struct) + (n ? n - 1 : 0) * sizeof(sl_value));
-            if (!s) { vm_error(vm, "out of memory"); goto fail; }
-            s->head.rc = 1; s->head.kind = SL_STRUCT; s->nfields = n;
-            sl_value *base = vm->sp - n;
-            for (uint16_t i = 0; i < n; i++) s->fields[i] = base[i];
-            vm->sp = base;
-            vm->live++;
-            PUSH(obj_value(&s->head));
-            break;
-        }
-
-        case OP_FGET: {
-            uint8_t idx = *ip++;
-            sl_value sv = POP();
-            if (sv.type != SL_OBJ || !sv.as.o || sv.as.o->kind != SL_STRUCT) {
-                sl_release(vm, sv); vm_error(vm, "not a struct"); goto fail;
-            }
-            sl_struct *s = (sl_struct *)sv.as.o;
-            if (idx >= s->nfields) { sl_release(vm, sv); vm_error(vm, "bad field index"); goto fail; }
-            sl_value f = s->fields[idx];
-            sl_retain(f);
-            sl_release(vm, sv);
-            PUSH(f);
-            break;
-        }
-
-        case OP_FSET: {
-            uint8_t idx = *ip++;
-            sl_value val = POP(), sv = POP();
-            if (sv.type != SL_OBJ || !sv.as.o || sv.as.o->kind != SL_STRUCT) {
-                sl_release(vm, val); sl_release(vm, sv);
-                vm_error(vm, "not a struct"); goto fail;
-            }
-            sl_struct *s = (sl_struct *)sv.as.o;
-            if (idx >= s->nfields) {
-                sl_release(vm, val); sl_release(vm, sv);
-                vm_error(vm, "bad field index"); goto fail;
-            }
-            sl_release(vm, s->fields[idx]);
-            s->fields[idx] = val;
-            sl_release(vm, sv);
-            break;
-        }
-
-        case OP_NEW_VARIANT: {
-            uint16_t tag = read_u16(&ip);
-            uint8_t n = *ip++;
+static SL_NOINLINE bool opf_NEWVAR(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            uint16_t tag = ip[1], n = ip[2];
             sl_variant *t = (sl_variant *)malloc(sizeof(sl_variant) + (n ? n - 1 : 0) * sizeof(sl_value));
-            if (!t) { vm_error(vm, "out of memory"); goto fail; }
+            if (!t) { vm_error(vm, "out of memory"); return false; }
             t->head.rc = 1; t->head.kind = SL_VARIANT; t->tag = tag; t->n = n;
-            sl_value *base = vm->sp - n;
-            for (uint8_t i = 0; i < n; i++) t->payload[i] = base[i];
-            vm->sp = base;
+            sl_value *items = &RR(0);
+            for (uint16_t i = 0; i < n; i++) { vstore(&t->payload[i], vload(&items[i])); items[i].type = SL_VOID; }
             vm->live++;
-            PUSH(obj_value(&t->head));
-            break;
-        }
+            vstore(&RR(0), obj_value(&t->head));
+    return true;
+}
 
-        case OP_VTAG: {
-            sl_value v = POP();
-            if (v.type != SL_OBJ || !v.as.o || v.as.o->kind != SL_VARIANT) {
-                sl_release(vm, v); vm_error(vm, "not an enum value"); goto fail;
+static SL_NOINLINE bool opf_NEWMAP(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            uint16_t n = ip[1];
+            sl_value mv = sl_map(vm, n);
+            if (vm->failed) return false;
+            sl_value *items = &RR(0);
+            for (uint16_t i = 0; i < n; i++) {
+                sl_value k = vload(&items[2 * i]), v = vload(&items[2 * i + 1]);
+                items[2 * i].type = SL_VOID; items[2 * i + 1].type = SL_VOID;
+                if (!sl_map_set(vm, mv, k, v)) { rel(vm, mv); return false; }
             }
-            uint16_t tag = ((sl_variant *)v.as.o)->tag;
-            sl_release(vm, v);
-            PUSH(sl_int(tag));
-            break;
-        }
+            vstore(&RR(0), mv);
+    return true;
+}
 
-        case OP_VGET: {
-            uint8_t idx = *ip++;
-            sl_value v = POP();
-            if (v.type != SL_OBJ || !v.as.o || v.as.o->kind != SL_VARIANT) {
-                sl_release(vm, v); vm_error(vm, "not an enum value"); goto fail;
-            }
+static SL_NOINLINE bool opf_MGET(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value mv = vload(&RR(1)), kv = vload(&RR(2));
+            if (mv.type != SL_OBJ || !mv.as.o || mv.as.o->kind != SL_MAP) { vm_error(vm, "not a map"); return false; }
+            sl_value out;
+            if (!sl_map_get(mv, kv, &out)) { vm_error(vm, "key not found"); return false; }
+            sl_retain(out);
+            drop(vm, &RR(2)); drop(vm, &RR(1));
+            vstore(&RR(0), out);
+    return true;
+}
+
+static SL_NOINLINE bool opf_MSET(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value mv = vload(&RR(0)), kv = vload(&RR(1)), val = vload(&RR(2));
+            if (mv.type != SL_OBJ || !mv.as.o || mv.as.o->kind != SL_MAP) { vm_error(vm, "not a map"); return false; }
+            moved(&RR(1)); moved(&RR(2));
+            if (!sl_map_set(vm, mv, kv, val)) return false;
+            drop(vm, &RR(0));
+    return true;
+}
+
+static SL_NOINLINE bool opf_VGET(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value v = vload(&RR(1));
+            uint16_t idx = ip[2];
+            if (v.type != SL_OBJ || !v.as.o || v.as.o->kind != SL_VARIANT) { vm_error(vm, "not an enum value"); return false; }
             sl_variant *t = (sl_variant *)v.as.o;
-            if (idx >= t->n) { sl_release(vm, v); vm_error(vm, "bad payload index"); goto fail; }
-            sl_value e = t->payload[idx];
+            if (idx >= t->n) { vm_error(vm, "bad payload index"); return false; }
+            sl_value e = vload(&t->payload[idx]);
             sl_retain(e);
-            sl_release(vm, v);
-            PUSH(e);
-            break;
-        }
+            drop(vm, &RR(1));
+            vstore(&RR(0), e);
+    return true;
+}
 
-        case OP_COPY: {
-            sl_value v = POP();
+static SL_NOINLINE bool opf_VTAG(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value v = vload(&RR(1));
+            if (v.type != SL_OBJ || !v.as.o || v.as.o->kind != SL_VARIANT) { vm_error(vm, "not an enum value"); return false; }
+            uint16_t tag = ((sl_variant *)v.as.o)->tag;
+            drop(vm, &RR(1));
+            set_int(&RR(0), tag);
+    return true;
+}
+
+static SL_NOINLINE bool opf_COPY(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value v = vload(&RR(1));
             sl_value c = struct_copy(vm, v);
-            sl_release(vm, v);
-            PUSH(c);
-            break;
-        }
+            drop(vm, &RR(1));
+            if (vm->failed) return false;
+            vstore(&RR(0), c);
+    return true;
+}
 
-        case OP_DUP2: {
-            sl_value a = vm->sp[-2], b = vm->sp[-1];
-            sl_retain(a); sl_retain(b);
-            PUSH(a); PUSH(b);
-            break;
-        }
+static SL_NOINLINE bool opf_NEWSTRUCT(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            uint16_t n = ip[1];
+            sl_struct *s = struct_alloc(vm, n);
+            if (!s) { vm_error(vm, "out of memory"); return false; }
+            s->head.rc = 1; s->head.kind = SL_STRUCT; s->nfields = n;
+            sl_value *items = &RR(0);
+            for (uint16_t i = 0; i < n; i++) { vstore(&s->fields[i], vload(&items[i])); items[i].type = SL_VOID; }
+            vm->live++;
+            vstore(&RR(0), obj_value(&s->head));
+    return true;
+}
 
-        case OP_NULL: {
-            sl_value v;
-            v.type = SL_OBJ;
-            v.as.o = NULL;
-            PUSH(v);
-            break;
-        }
+static SL_NOINLINE bool opf_NEWARR(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            uint16_t n = ip[1];
+            sl_value av = sl_array(vm, n);
+            if (vm->failed) return false;
+            sl_arr *a = (sl_arr *)av.as.o;
+            sl_value *items = &RR(0);
+            for (uint16_t i = 0; i < n; i++) {
+                bool ok = array_push(vm, a, vload(&items[i]));
+                items[i].type = SL_VOID;
+                if (!ok) { rel(vm, av); return false; }
+            }
+            vstore(&RR(0), av);
+    return true;
+}
 
-        case OP_LOADG: {
-            uint16_t g = read_u16(&ip);
-            if (g >= vm->nglobals) { vm_error(vm, "bad global index"); goto fail; }
-            sl_value v = vm->globals[g];
+static SL_NOINLINE bool opf_LDS(sl_vm *vm, sl_value *R, uint16_t *ip) {
+            sl_value s = const_str(vm, ip[1]);
+            if (vm->failed) return false;
+            vstore(&RR(0), s);
+    return true;
+}
+
+
+
+// Left alone, gcc merges identical handler tails back into one shared jump,
+// which defeats threading, and turns short conditional jumps into conditional
+// moves, which makes the next instruction wait on the comparison instead of
+// on a branch prediction. These options turn both off for sl_run.
+#if defined(SL_THREADED) && defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-gcse", "no-crossjumping", "no-tree-slp-vectorize", "no-if-conversion", "no-if-conversion2")))
+#endif
+sl_result sl_run(sl_vm *vm) {
+    if (vm->nfuncs == 0) { vm_error(vm, "nothing loaded"); return SL_ERR_RUNTIME; }
+
+    sl_value *const stack_end = vm->stack + SL_STACK_MAX;
+    sl_func *fn = &vm->funcs[vm->entry];
+    sl_value *R = vm->stack;
+    if (R + fn->nregs > stack_end) { vm_error(vm, "stack overflow"); return SL_ERR_RUNTIME; }
+    vm->nframes = 0;
+    vm->failed = false;
+    vm->err[0] = 0;
+    sl_frame *const frames_first = vm->frames;
+    sl_frame *const frames_last = vm->frames + SL_FRAMES_MAX - 1;
+    sl_frame *fr = frames_first;
+    fr->fn = fn; fr->ip = fn->rcode; fr->base = R;
+    uint16_t *ip = fn->rcode;
+    bool want_equal, array_owned;
+
+#ifdef SL_THREADED
+    static const void *const dispatch[256] = {
+        [0 ... 255] = &&L_unknown,
+        [R_LDI] = &&L_R_LDI,
+        [R_LDC_I] = &&L_R_LDC_I,
+        [R_LDC_F] = &&L_R_LDC_F,
+        [R_LDS] = &&L_R_LDS,
+        [R_LDB] = &&L_R_LDB,
+        [R_LDNULL] = &&L_R_LDNULL,
+        [R_MOV] = &&L_R_MOV,
+        [R_MOVS] = &&L_R_MOVS,
+        [R_STORE] = &&L_R_STORE,
+        [R_STORE_L] = &&L_R_STORE_L,
+        [R_DROP] = &&L_R_DROP,
+        [R_ADD_I] = &&L_R_ADD_I,
+        [R_SUB_I] = &&L_R_SUB_I,
+        [R_MUL_I] = &&L_R_MUL_I,
+        [R_DIV_I] = &&L_R_DIV_I,
+        [R_REM_I] = &&L_R_REM_I,
+        [R_ADDI] = &&L_R_ADDI,
+        [R_NEG_I] = &&L_R_NEG_I,
+        [R_ADD_F] = &&L_R_ADD_F,
+        [R_SUB_F] = &&L_R_SUB_F,
+        [R_MUL_F] = &&L_R_MUL_F,
+        [R_DIV_F] = &&L_R_DIV_F,
+        [R_REM_F] = &&L_R_REM_F,
+        [R_NEG_F] = &&L_R_NEG_F,
+        [R_EQ_I] = &&L_R_EQ_I,
+        [R_NE_I] = &&L_R_NE_I,
+        [R_LT_I] = &&L_R_LT_I,
+        [R_LE_I] = &&L_R_LE_I,
+        [R_GT_I] = &&L_R_GT_I,
+        [R_GE_I] = &&L_R_GE_I,
+        [R_EQ_F] = &&L_R_EQ_F,
+        [R_NE_F] = &&L_R_NE_F,
+        [R_LT_F] = &&L_R_LT_F,
+        [R_LE_F] = &&L_R_LE_F,
+        [R_GT_F] = &&L_R_GT_F,
+        [R_GE_F] = &&L_R_GE_F,
+        [R_EQ_B] = &&L_R_EQ_B,
+        [R_NE_B] = &&L_R_NE_B,
+        [R_NOT] = &&L_R_NOT,
+        [R_EQ_S] = &&L_R_EQ_S,
+        [R_NE_S] = &&L_R_NE_S,
+        [R_CONCAT] = &&L_R_CONCAT,
+        [R_STR_I] = &&L_R_STR_I,
+        [R_STR_F] = &&L_R_STR_F,
+        [R_STR_B] = &&L_R_STR_B,
+        [R_STR_OBJ] = &&L_R_STR_OBJ,
+        [R_JMP] = &&L_R_JMP,
+        [R_JT] = &&L_R_JT,
+        [R_JF] = &&L_R_JF,
+        [R_JC_EQ_I] = &&L_R_JC_EQ_I,
+        [R_JC_NE_I] = &&L_R_JC_NE_I,
+        [R_JC_LT_I] = &&L_R_JC_LT_I,
+        [R_JC_LE_I] = &&L_R_JC_LE_I,
+        [R_JC_GT_I] = &&L_R_JC_GT_I,
+        [R_JC_GE_I] = &&L_R_JC_GE_I,
+        [R_JC_EQ_F] = &&L_R_JC_EQ_F,
+        [R_JC_NE_F] = &&L_R_JC_NE_F,
+        [R_JC_LT_F] = &&L_R_JC_LT_F,
+        [R_JC_LE_F] = &&L_R_JC_LE_F,
+        [R_JC_GT_F] = &&L_R_JC_GT_F,
+        [R_JC_GE_F] = &&L_R_JC_GE_F,
+        [R_JN_EQ_F] = &&L_R_JN_EQ_F,
+        [R_JN_NE_F] = &&L_R_JN_NE_F,
+        [R_JN_LT_F] = &&L_R_JN_LT_F,
+        [R_JN_LE_F] = &&L_R_JN_LE_F,
+        [R_JN_GT_F] = &&L_R_JN_GT_F,
+        [R_JN_GE_F] = &&L_R_JN_GE_F,
+        [R_JCI_EQ] = &&L_R_JCI_EQ,
+        [R_JCI_NE] = &&L_R_JCI_NE,
+        [R_JCI_LT] = &&L_R_JCI_LT,
+        [R_JCI_LE] = &&L_R_JCI_LE,
+        [R_JCI_GT] = &&L_R_JCI_GT,
+        [R_JCI_GE] = &&L_R_JCI_GE,
+        [R_CALL] = &&L_R_CALL,
+        [R_NATIVE] = &&L_R_NATIVE,
+        [R_RET] = &&L_R_RET,
+        [R_RETV] = &&L_R_RETV,
+        [R_HALT] = &&L_R_HALT,
+        [R_NEWARR] = &&L_R_NEWARR,
+        [R_AGET] = &&L_R_AGET,
+        [R_AGET_L] = &&L_R_AGET_L,
+        [R_ASET] = &&L_R_ASET,
+        [R_ASET_L] = &&L_R_ASET_L,
+        [R_ALEN] = &&L_R_ALEN,
+        [R_ALEN_L] = &&L_R_ALEN_L,
+        [R_APUSH] = &&L_R_APUSH,
+        [R_APUSH_L] = &&L_R_APUSH_L,
+        [R_SLICE] = &&L_R_SLICE,
+        [R_NEWSTRUCT] = &&L_R_NEWSTRUCT,
+        [R_FGET] = &&L_R_FGET,
+        [R_FGET_L] = &&L_R_FGET_L,
+        [R_FSET] = &&L_R_FSET,
+        [R_FSET_L] = &&L_R_FSET_L,
+        [R_NEWVAR] = &&L_R_NEWVAR,
+        [R_VTAG] = &&L_R_VTAG,
+        [R_VGET] = &&L_R_VGET,
+        [R_LOADG] = &&L_R_LOADG,
+        [R_STOREG] = &&L_R_STOREG,
+        [R_COPY] = &&L_R_COPY,
+        [R_NEWMAP] = &&L_R_NEWMAP,
+        [R_MGET] = &&L_R_MGET,
+        [R_MSET] = &&L_R_MSET,
+        [R_AJLT] = &&L_R_AJLT,
+        [R_AJLTI] = &&L_R_AJLTI,
+        [R_JLTLEN] = &&L_R_JLTLEN,
+        [R_MOV2] = &&L_R_MOV2,
+        [R_MOV3] = &&L_R_MOV3,
+        [R_AGET_S] = &&L_R_AGET_S,
+        [R_ASET_LC] = &&L_R_ASET_LC,
+        [R_APUSH_LC] = &&L_R_APUSH_LC,
+        [R_AGET_LU] = &&L_R_AGET_LU,
+        [R_ASET_LU] = &&L_R_ASET_LU,
+        [R_AGET_SU] = &&L_R_AGET_SU,
+        [R_ASET_LCU] = &&L_R_ASET_LCU,
+    };
+#endif
+
+    SL_DISPATCH_BEGIN
+
+        OPC(R_LDI):    set_int(&RR(0), IMM(1)); ip += 2; NEXT();
+        OPC(R_LDC_I): {
+            uint64_t u = (uint64_t)ip[1] | ((uint64_t)ip[2] << 16) | ((uint64_t)ip[3] << 32) | ((uint64_t)ip[4] << 48);
+            set_int(&RR(0), (int64_t)u);
+            ip += 5; NEXT();
+        }
+        OPC(R_LDC_F): {
+            uint64_t u = (uint64_t)ip[1] | ((uint64_t)ip[2] << 16) | ((uint64_t)ip[3] << 32) | ((uint64_t)ip[4] << 48);
+            double d;
+            memcpy(&d, &u, sizeof d);
+            set_flt(&RR(0), d);
+            ip += 5; NEXT();
+        }
+        OPC(R_LDS): if (!opf_LDS(vm, R, ip)) goto fail; ip += 2; NEXT();
+        OPC(R_LDB):    set_bool(&RR(0), ip[1] != 0); ip += 2; NEXT();
+        OPC(R_LDNULL): { sl_value v; v.type = SL_OBJ; v.as.o = NULL; vstore(&RR(0), v); ip += 1; NEXT(); }
+
+        OPC(R_MOV): {
+            sl_value v = vload(&RR(1));
             sl_retain(v);
-            PUSH(v);
-            break;
+            vstore(&RR(0), v);
+            ip += 2; NEXT();
+        }
+        OPC(R_MOVS):   vstore(&RR(0), vload(&RR(1))); ip += 2; NEXT();
+        OPC(R_STORE): {
+            sl_value old = vload(&RR(0));
+            vstore(&RR(0), vload(&RR(1)));
+            moved(&RR(1));
+            rel(vm, old);
+            ip += 2; NEXT();
+        }
+        OPC(R_STORE_L): {
+            sl_value v = vload(&RR(1));
+            sl_retain(v);
+            sl_value old = vload(&RR(0));
+            vstore(&RR(0), v);
+            rel(vm, old);
+            ip += 2; NEXT();
+        }
+        OPC(R_DROP):   drop(vm, &RR(0)); ip += 1; NEXT();
+
+        OPC(R_ADD_I): set_int(&RR(0), RR(1).as.i + RR(2).as.i); ip += 3; NEXT();
+        OPC(R_SUB_I): set_int(&RR(0), RR(1).as.i - RR(2).as.i); ip += 3; NEXT();
+        OPC(R_MUL_I): set_int(&RR(0), RR(1).as.i * RR(2).as.i); ip += 3; NEXT();
+        OPC(R_DIV_I): {
+            int64_t b = RR(2).as.i;
+            if (b == 0) { vm_error(vm, "division by zero"); goto fail; }
+            set_int(&RR(0), RR(1).as.i / b);
+            ip += 3; NEXT();
+        }
+        OPC(R_REM_I): {
+            int64_t b = RR(2).as.i;
+            if (b == 0) { vm_error(vm, "remainder by zero"); goto fail; }
+            set_int(&RR(0), RR(1).as.i % b);
+            ip += 3; NEXT();
+        }
+        OPC(R_ADDI):  set_int(&RR(0), RR(1).as.i + IMM(2)); ip += 3; NEXT();
+        OPC(R_NEG_I): set_int(&RR(0), -RR(1).as.i); ip += 2; NEXT();
+
+        OPC(R_ADD_F): set_flt(&RR(0), RR(1).as.f + RR(2).as.f); ip += 3; NEXT();
+        OPC(R_SUB_F): set_flt(&RR(0), RR(1).as.f - RR(2).as.f); ip += 3; NEXT();
+        OPC(R_MUL_F): set_flt(&RR(0), RR(1).as.f * RR(2).as.f); ip += 3; NEXT();
+        OPC(R_DIV_F): set_flt(&RR(0), RR(1).as.f / RR(2).as.f); ip += 3; NEXT();
+        OPC(R_REM_F): set_flt(&RR(0), fmod(RR(1).as.f, RR(2).as.f)); ip += 3; NEXT();
+        OPC(R_NEG_F): set_flt(&RR(0), -RR(1).as.f); ip += 2; NEXT();
+
+#define CMP_HANDLERS(N, OPER) \
+        OPC(R_##N##_I): set_bool(&RR(0), RR(1).as.i OPER RR(2).as.i); ip += 3; NEXT(); \
+        OPC(R_##N##_F): set_bool(&RR(0), RR(1).as.f OPER RR(2).as.f); ip += 3; NEXT();
+        CMP_HANDLERS(EQ, ==) CMP_HANDLERS(NE, !=) CMP_HANDLERS(LT, <)
+        CMP_HANDLERS(LE, <=) CMP_HANDLERS(GT, >)  CMP_HANDLERS(GE, >=)
+#undef CMP_HANDLERS
+
+        OPC(R_EQ_B): set_bool(&RR(0), RR(1).as.b == RR(2).as.b); ip += 3; NEXT();
+        OPC(R_NE_B): set_bool(&RR(0), RR(1).as.b != RR(2).as.b); ip += 3; NEXT();
+        OPC(R_NOT):  set_bool(&RR(0), !RR(1).as.b); ip += 2; NEXT();
+
+        OPC(R_EQ_S): want_equal = true;  goto str_compare;
+        OPC(R_NE_S): want_equal = false;
+        str_compare: {
+            sl_value a = vload(&RR(1)), b = vload(&RR(2));
+            size_t an, bn;
+            const char *ap = sl_as_str(a, &an), *bp = sl_as_str(b, &bn);
+            bool eq = (an == bn) && memcmp(ap, bp, an) == 0;
+            drop(vm, &RR(1)); drop(vm, &RR(2));
+            set_bool(&RR(0), want_equal ? eq : !eq);
+            ip += 3; NEXT();
         }
 
-        case OP_STOREG: {
-            uint16_t g = read_u16(&ip);
-            if (g >= vm->nglobals) { vm_error(vm, "bad global index"); goto fail; }
-            sl_value v = POP();
-            sl_release(vm, vm->globals[g]);
-            vm->globals[g] = v;         // ownership moves out of the stack
-            break;
+        OPC(R_CONCAT): if (!opf_CONCAT(vm, R, ip)) goto fail; ip += 3; NEXT();
+        OPC(R_STR_I): if (!opf_STR_I(vm, R, ip)) goto fail; ip += 2; NEXT();
+        OPC(R_STR_F): if (!opf_STR_F(vm, R, ip)) goto fail; ip += 2; NEXT();
+        OPC(R_STR_B): if (!opf_STR_B(vm, R, ip)) goto fail; ip += 2; NEXT();
+        OPC(R_STR_OBJ): if (!opf_STR_OBJ(vm, R, ip)) goto fail; ip += 2; NEXT();
+
+        OPC(R_JMP): ip += 1 + OFFSET(0); NEXT();
+        OPC(R_JT): if (RR(0).as.b) ip += 2 + OFFSET(1); else ip += 2; NEXT();
+        OPC(R_JF): if (!RR(0).as.b) ip += 2 + OFFSET(1); else ip += 2; NEXT();
+
+        OPC(R_AJLT): {
+            int64_t v = RR(0).as.i + IMM(2);
+            set_int(&RR(0), v);
+            if (v < RR(1).as.i) ip += 4 + OFFSET(3); else ip += 4;
+            NEXT();
+        }
+        OPC(R_MOV2): {
+            sl_value v1 = vload(&RR(1)), v2 = vload(&RR(3));
+            sl_retain(v1); sl_retain(v2);
+            vstore(&RR(0), v1); vstore(&RR(2), v2);
+            ip += 4; NEXT();
+        }
+        OPC(R_MOV3): {
+            sl_value v1 = vload(&RR(1)), v2 = vload(&RR(3)), v3 = vload(&RR(5));
+            sl_retain(v1); sl_retain(v2); sl_retain(v3);
+            vstore(&RR(0), v1); vstore(&RR(2), v2); vstore(&RR(4), v3);
+            ip += 6; NEXT();
+        }
+        OPC(R_AGET_S): {
+            const sl_value *av = &RR(1);
+            int64_t iv = RR(2).as.i;
+            if (av->type != SL_OBJ || !av->as.o || av->as.o->kind != SL_ARRAY) { vm_error(vm, "not an array"); goto fail; }
+            sl_arr *a = (sl_arr *)av->as.o;
+            int64_t i = iv < 0 ? iv + a->len : iv;
+            if (i < 0 || i >= a->len) {
+                vm_error(vm, "index %lld is out of bounds for an array of length %lld", (long long)iv, (long long)a->len);
+                goto fail;
+            }
+            sl_value e = arr_get(a, i);
+            sl_retain(e);
+            sl_value old = vload(&RR(0));
+            vstore(&RR(0), e);
+            rel(vm, old);
+            ip += 3; NEXT();
+        }
+        OPC(R_ASET_LC): {
+            sl_value av = vload(&RR(0));
+            int64_t iv = RR(1).as.i;
+            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) { vm_error(vm, "not an array"); goto fail; }
+            sl_arr *a = (sl_arr *)av.as.o;
+            int64_t i = iv < 0 ? iv + a->len : iv;
+            if (i < 0 || i >= a->len) {
+                vm_error(vm, "index %lld is out of bounds for an array of length %lld", (long long)iv, (long long)a->len);
+                goto fail;
+            }
+            sl_value nv = vload(&RR(2));
+            if (a->ek != AK_GEN && a->ek != ak_of(nv) && !arr_generify(vm, a)) goto fail;
+            sl_retain(nv);
+            sl_value old = arr_get(a, i);
+            arr_put(a, i, nv);
+            rel(vm, old);
+            ip += 3; NEXT();
+        }
+        OPC(R_APUSH_LC): {
+            sl_value av = vload(&RR(0));
+            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) { vm_error(vm, "not an array"); goto fail; }
+            sl_value val = vload(&RR(1));
+            sl_retain(val);
+            if (!array_push(vm, (sl_arr *)av.as.o, val)) goto fail;
+            ip += 2; NEXT();
+        }
+        // Unchecked accesses: the optimizer proved 0 <= index < length. With
+        // SL_OPT_ASSERT they check anyway and stop if the proof was wrong.
+#ifdef SL_OPT_ASSERT
+#define OPT_PROVEN(a, i) do { if (!(a) || (i) < 0 || (i) >= (a)->len) { fprintf(stderr, "optimizer: a bound it proved does not hold\n"); abort(); } } while (0)
+#else
+#define OPT_PROVEN(a, i) ((void)0)
+#endif
+        OPC(R_AGET_LU): {
+            sl_arr *a = (sl_arr *)RR(1).as.o;
+            int64_t i = RR(2).as.i;
+            OPT_PROVEN(a, i);
+            sl_value e = arr_get(a, i);
+            sl_retain(e);
+            vstore(&RR(0), e);
+            ip += 3; NEXT();
+        }
+        OPC(R_AGET_SU): {
+            sl_arr *a = (sl_arr *)RR(1).as.o;
+            int64_t i = RR(2).as.i;
+            OPT_PROVEN(a, i);
+            sl_value e = arr_get(a, i);
+            sl_retain(e);
+            sl_value old = vload(&RR(0));
+            vstore(&RR(0), e);
+            rel(vm, old);
+            ip += 3; NEXT();
+        }
+        OPC(R_ASET_LU): {
+            sl_arr *a = (sl_arr *)RR(0).as.o;
+            int64_t i = RR(1).as.i;
+            OPT_PROVEN(a, i);
+            sl_value nv = vload(&RR(2));
+            if (a->ek != AK_GEN && a->ek != ak_of(nv) && !arr_generify(vm, a)) goto fail;
+            sl_value old = arr_get(a, i);
+            arr_put(a, i, nv);
+            moved(&RR(2));
+            rel(vm, old);
+            ip += 3; NEXT();
+        }
+        OPC(R_ASET_LCU): {
+            sl_arr *a = (sl_arr *)RR(0).as.o;
+            int64_t i = RR(1).as.i;
+            OPT_PROVEN(a, i);
+            sl_value nv = vload(&RR(2));
+            if (a->ek != AK_GEN && a->ek != ak_of(nv) && !arr_generify(vm, a)) goto fail;
+            sl_retain(nv);
+            sl_value old = arr_get(a, i);
+            arr_put(a, i, nv);
+            rel(vm, old);
+            ip += 3; NEXT();
+        }
+        OPC(R_JLTLEN): {
+            sl_value av = vload(&RR(1));
+            int64_t n;
+            if (av.type == SL_OBJ && av.as.o && av.as.o->kind == SL_ARRAY) n = ((sl_arr *)av.as.o)->len;
+            else if (av.type == SL_OBJ && av.as.o && av.as.o->kind == SL_STR) n = utf8_length(av);
+            else if (av.type == SL_OBJ && av.as.o && av.as.o->kind == SL_MAP) n = sl_map_len(av);
+            else n = sl_array_len(av);
+            if (RR(0).as.i < n) ip += 3 + OFFSET(2); else ip += 3;
+            NEXT();
+        }
+        OPC(R_AJLTI): {
+            int64_t v = RR(0).as.i + IMM(2);
+            set_int(&RR(0), v);
+            if (v < (int64_t)IMM(1)) ip += 4 + OFFSET(3); else ip += 4;
+            NEXT();
         }
 
-        case OP_CALL: {
-            uint16_t id = read_u16(&ip);
-            uint8_t argc = *ip++;
-            if (id >= vm->nfuncs) { vm_error(vm, "bad function index"); goto fail; }
-            if (vm->nframes >= SL_FRAMES_MAX) {
+#define JUMP_HANDLERS(N, OPER) \
+        OPC(R_JC_##N##_I): if (RR(0).as.i OPER RR(1).as.i) ip += 3 + OFFSET(2); else ip += 3; NEXT(); \
+        OPC(R_JC_##N##_F): if (RR(0).as.f OPER RR(1).as.f) ip += 3 + OFFSET(2); else ip += 3; NEXT(); \
+        OPC(R_JN_##N##_F): if (!(RR(0).as.f OPER RR(1).as.f)) ip += 3 + OFFSET(2); else ip += 3; NEXT(); \
+        OPC(R_JCI_##N):    if (RR(0).as.i OPER (int64_t)IMM(1)) ip += 3 + OFFSET(2); else ip += 3; NEXT();
+        JUMP_HANDLERS(EQ, ==) JUMP_HANDLERS(NE, !=) JUMP_HANDLERS(LT, <)
+        JUMP_HANDLERS(LE, <=) JUMP_HANDLERS(GT, >)  JUMP_HANDLERS(GE, >=)
+#undef JUMP_HANDLERS
+
+        OPC(R_CALL): {
+            uint16_t id = ip[0];
+            sl_func *callee = &vm->funcs[id];
+            if (fr >= frames_last) {
                 vm_error(vm, "call depth exceeded %d (infinite recursion?)", SL_FRAMES_MAX);
                 goto fail;
             }
-            sl_func *callee = &vm->funcs[id];
-            fr->ip = ip;
-            sl_value *args = vm->sp - argc;
-            if (args + callee->nslots > vm->stack + SL_STACK_MAX) {
-                vm_error(vm, "stack overflow"); goto fail;
-            }
-            sl_frame *nf = &vm->frames[vm->nframes++];
-            nf->fn = callee; nf->ip = callee->code; nf->slots = args;
-            for (uint16_t s = argc; s < callee->nslots; s++) args[s] = sl_void();
-            vm->sp = args + callee->nslots;
-            fr = nf;
-            ip = nf->ip;
-            break;
+            sl_value *nR = R + ip[1];
+            if (nR + callee->nregs > stack_end) { vm_error(vm, "stack overflow"); goto fail; }
+            fr->ip = ip + 2;
+            fr++;
+            fr->fn = callee; fr->base = nR;
+            fn = callee; R = nR;
+            ip = callee->rcode;
+            NEXT();
         }
 
-        case OP_NATIVE: {
-            uint16_t idx = read_u16(&ip);
-            uint8_t argc = *ip++;
-            if (idx >= vm->nnative_names) { vm_error(vm, "bad native index"); goto fail; }
+        OPC(R_NATIVE): {
+            uint16_t idx = ip[0];
             int slot = vm->native_bind[idx];
             if (slot < 0) {
                 vm_error(vm, "`%s` is declared extern but the host did not register it",
                          vm->native_names[idx]);
                 goto fail;
             }
-            sl_value *argv = vm->sp - argc;
+            sl_value *argv = &RR(1);
+            uint16_t argc = ip[2];
+            bool nres = ip[3] != 0;
             sl_value result = vm->registry[slot].fn(vm, argc, argv);
-            for (uint8_t i = 0; i < argc; i++) sl_release(vm, argv[i]);
-            vm->sp = argv;
-            if (vm->failed) { sl_release(vm, result); goto fail; }
-            if (result.type != SL_VOID) PUSH(result);
-            break;
+            for (uint16_t i = 0; i < argc; i++) drop(vm, &argv[i]);
+            if (vm->failed) { rel(vm, result); goto fail; }
+            if (nres) vstore(&argv[0], result); else rel(vm, result);
+            ip += 4; NEXT();
         }
 
-        case OP_RET:
-        case OP_RET_VOID: {
-            sl_value result = (op == OP_RET) ? POP() : sl_void();
-            // Drop everything this frame owned before unwinding.
-            for (sl_value *p = fr->slots; p < vm->sp; p++) sl_release(vm, *p);
-            vm->nframes--;
-            vm->sp = fr->slots;
-            if (vm->nframes == 0) { sl_release(vm, result); return SL_OK; }
-            fr = &vm->frames[vm->nframes - 1];
-            ip = fr->ip;
-            if (op == OP_RET) PUSH(result);
-            break;
+        OPC(R_RET): {
+            sl_value result = vload(&RR(0));
+            moved(&RR(0));
+            for (sl_value *p = R, *end = R + fn->nregs; p < end; p++) drop(vm, p);
+            if (fr == frames_first) { rel(vm, result); return SL_OK; }
+            vstore(&R[0], result);
+            fr--;
+            fn = fr->fn; R = fr->base; ip = fr->ip;
+            NEXT();
+        }
+        OPC(R_RETV): {
+            for (sl_value *p = R, *end = R + fn->nregs; p < end; p++) drop(vm, p);
+            if (fr == frames_first) return SL_OK;
+            R[0].type = SL_VOID;
+            fr--;
+            fn = fr->fn; R = fr->base; ip = fr->ip;
+            NEXT();
+        }
+        OPC(R_HALT): goto done;
+
+        OPC(R_NEWARR): if (!opf_NEWARR(vm, R, ip)) goto fail; ip += 2; NEXT();
+
+        OPC(R_AGET): {
+            sl_value av = vload(&RR(1));
+            int64_t iv = RR(2).as.i;
+            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) { vm_error(vm, "not an array"); goto fail; }
+            sl_arr *a = (sl_arr *)av.as.o;
+            int64_t i = iv < 0 ? iv + a->len : iv;
+            if (i < 0 || i >= a->len) {
+                vm_error(vm, "index %lld is out of bounds for an array of length %lld", (long long)iv, (long long)a->len);
+                goto fail;
+            }
+            sl_value e = arr_get(a, i);
+            sl_retain(e);
+            RR(1).type = SL_VOID;
+            rel(vm, av);
+            vstore(&RR(0), e);
+            ip += 3; NEXT();
+        }
+        OPC(R_AGET_L): {
+            const sl_value *av = &RR(1);
+            int64_t iv = RR(2).as.i;
+            if (av->type != SL_OBJ || !av->as.o || av->as.o->kind != SL_ARRAY) { vm_error(vm, "not an array"); goto fail; }
+            sl_arr *a = (sl_arr *)av->as.o;
+            int64_t i = iv < 0 ? iv + a->len : iv;
+            if (i < 0 || i >= a->len) {
+                vm_error(vm, "index %lld is out of bounds for an array of length %lld", (long long)iv, (long long)a->len);
+                goto fail;
+            }
+            sl_value e = arr_get(a, i);
+            sl_retain(e);
+            vstore(&RR(0), e);
+            ip += 3; NEXT();
+        }
+        OPC(R_ASET): array_owned = true;  goto aset_common;
+        OPC(R_ASET_L): array_owned = false;
+        aset_common: {
+            sl_value av = vload(&RR(0));
+            int64_t iv = RR(1).as.i;
+            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) { vm_error(vm, "not an array"); goto fail; }
+            sl_arr *a = (sl_arr *)av.as.o;
+            int64_t i = iv < 0 ? iv + a->len : iv;
+            if (i < 0 || i >= a->len) {
+                vm_error(vm, "index %lld is out of bounds for an array of length %lld", (long long)iv, (long long)a->len);
+                goto fail;
+            }
+            sl_value nv = vload(&RR(2));
+            if (a->ek != AK_GEN && a->ek != ak_of(nv) && !arr_generify(vm, a)) goto fail;
+            sl_value old = arr_get(a, i);
+            arr_put(a, i, nv);
+            moved(&RR(2));
+            rel(vm, old);
+            if (array_owned) drop(vm, &RR(0));
+            ip += 3; NEXT();
+        }
+        OPC(R_ALEN): array_owned = true;  goto alen_common;
+        OPC(R_ALEN_L): array_owned = false;
+        alen_common: {
+            sl_value av = vload(&RR(1));
+            int64_t n;
+            if (av.type == SL_OBJ && av.as.o && av.as.o->kind == SL_STR) n = utf8_length(av);
+            else if (av.type == SL_OBJ && av.as.o && av.as.o->kind == SL_MAP) n = sl_map_len(av);
+            else n = sl_array_len(av);
+            if (array_owned) drop(vm, &RR(1));
+            set_int(&RR(0), n);
+            ip += 2; NEXT();
+        }
+        OPC(R_APUSH): array_owned = true;  goto apush_common;
+        OPC(R_APUSH_L): array_owned = false;
+        apush_common: {
+            sl_value av = vload(&RR(0));
+            if (av.type != SL_OBJ || !av.as.o || av.as.o->kind != SL_ARRAY) { vm_error(vm, "not an array"); goto fail; }
+            sl_value val = vload(&RR(1));
+            moved(&RR(1));
+            if (!array_push(vm, (sl_arr *)av.as.o, val)) goto fail;
+            if (array_owned) drop(vm, &RR(0));
+            ip += 2; NEXT();
+        }
+        OPC(R_SLICE): if (!opf_SLICE(vm, R, ip)) goto fail; ip += 4; NEXT();
+
+        OPC(R_NEWSTRUCT): if (!opf_NEWSTRUCT(vm, R, ip)) goto fail; ip += 3; NEXT();
+        OPC(R_FGET): array_owned = true;  goto fget_common;
+        OPC(R_FGET_L): array_owned = false;
+        fget_common: {
+            const sl_value *sv = &RR(1);
+            uint16_t idx = ip[2];
+            if (sv->type != SL_OBJ || !sv->as.o || sv->as.o->kind != SL_STRUCT) { vm_error(vm, "not a struct"); goto fail; }
+            sl_struct *s = (sl_struct *)sv->as.o;
+            if (idx >= s->nfields) { vm_error(vm, "bad field index"); goto fail; }
+            sl_value f = vload(&s->fields[idx]);
+            sl_retain(f);
+            if (array_owned) drop(vm, &RR(1));
+            vstore(&RR(0), f);
+            ip += 3; NEXT();
+        }
+        OPC(R_FSET): array_owned = true;  goto fset_common;
+        OPC(R_FSET_L): array_owned = false;
+        fset_common: {
+            const sl_value *sv = &RR(0);
+            uint16_t idx = ip[1];
+            if (sv->type != SL_OBJ || !sv->as.o || sv->as.o->kind != SL_STRUCT) { vm_error(vm, "not a struct"); goto fail; }
+            sl_struct *s = (sl_struct *)sv->as.o;
+            if (idx >= s->nfields) { vm_error(vm, "bad field index"); goto fail; }
+            sl_value old = vload(&s->fields[idx]);
+            vstore(&s->fields[idx], vload(&RR(2)));
+            moved(&RR(2));
+            rel(vm, old);
+            if (array_owned) drop(vm, &RR(0));
+            ip += 3; NEXT();
         }
 
-        case OP_HALT: goto done;
+        OPC(R_NEWVAR): if (!opf_NEWVAR(vm, R, ip)) goto fail; ip += 3; NEXT();
+        OPC(R_VTAG): if (!opf_VTAG(vm, R, ip)) goto fail; ip += 2; NEXT();
+        OPC(R_VGET): if (!opf_VGET(vm, R, ip)) goto fail; ip += 3; NEXT();
 
+        OPC(R_LOADG): {
+            sl_value v = vload(&vm->globals[ip[1]]);
+            sl_retain(v);
+            vstore(&RR(0), v);
+            ip += 2; NEXT();
+        }
+        OPC(R_STOREG): {
+            sl_value old = vload(&vm->globals[ip[0]]);
+            vstore(&vm->globals[ip[0]], vload(&RR(1)));
+            moved(&RR(1));
+            rel(vm, old);
+            ip += 2; NEXT();
+        }
+        OPC(R_COPY): if (!opf_COPY(vm, R, ip)) goto fail; ip += 3; NEXT();
+
+        OPC(R_NEWMAP): if (!opf_NEWMAP(vm, R, ip)) goto fail; ip += 2; NEXT();
+        OPC(R_MGET): if (!opf_MGET(vm, R, ip)) goto fail; ip += 3; NEXT();
+        OPC(R_MSET): if (!opf_MSET(vm, R, ip)) goto fail; ip += 3; NEXT();
+
+#ifdef SL_THREADED
+        L_unknown:
+#else
         default:
-            vm_error(vm, "unknown opcode %u", op);
+#endif
+            vm_error(vm, "unknown opcode %u", ip[-1]);
             goto fail;
-        }
-    }
+
+    SL_DISPATCH_END
 
 done:
-    while (vm->sp > vm->stack) sl_release(vm, *--vm->sp);
+    release_stack(vm, R + fn->nregs);
+    vm->nframes = 0;
     return SL_OK;
 
 fail:
     // Unwind every frame so a fault does not leak the whole stack.
-    while (vm->sp > vm->stack) sl_release(vm, *--vm->sp);
+    release_stack(vm, R + fn->nregs);
     vm->nframes = 0;
     return SL_ERR_RUNTIME;
 }
+
+#ifdef SL_AOT_EMITTER
+#include "aot_emit.inc"
+#endif

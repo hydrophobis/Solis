@@ -9,7 +9,7 @@ cflags = "-std=c23 -O2 -Wall -Wextra"
 exe = { on = "platform", windows = ".exe", default = "" }
 
 compiler_headers = { in = "compiler", ending = [".h"] }
-runtime_headers = { in = "runtime", ending = [".h"] }
+runtime_headers = { in = "runtime", ending = [".h", ".inc"] }
 std_sources = { in = "std", ending = [".sl"] }
 compiler_sources = { in = "compiler", ending = [".c"] }
 runtime_sources = { in = "runtime", ending = [".c"] }
@@ -25,7 +25,7 @@ cflags = "-std=c23 -O2 -Wall -Wextra -pedantic -Werror"
 
 [tasks.solis]
 command = "{cc}"
-flags = "{cflags} -Icompiler -Iruntime"
+flags = "{cflags} -Icompiler -Iruntime -DSL_AOT_EMITTER -DSL_DEBUG_ENV"
 files = "{compiler_sources} {runtime_sources} cli/solis.c"
 headers = "{compiler_headers} {runtime_headers} {std_sources}"
 output = "-o solis{exe} -lm"
@@ -87,6 +87,11 @@ command = "bash tools/bless.sh --yes"
 depends = ["solis", "fallback"]
 always_run = true
 command = "bash tools/conform.sh"
+
+[tasks.rules]
+default = false
+always_run = true
+command = "python tools/optrules.py --check"
 
 [tasks.batteries]
 depends = ["solis"]
