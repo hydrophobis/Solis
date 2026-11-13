@@ -63,6 +63,11 @@ headers = { in = "runtime", ending = [".h", ".hpp"] }
 output = "-o runtime/solis-run++{exe} -lm"
 outputs = ["runtime/solis-run++{exe}"]
 
+[tasks.embed]
+default = false
+always_run = true
+command = "make -C examples/embed"
+
 [tasks.std]
 default = false
 always_run = true

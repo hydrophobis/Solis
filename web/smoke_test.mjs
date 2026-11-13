@@ -4,9 +4,9 @@ const vm = await Solis.create();
 
 let out = [];
 vm.register("print", (...parts) => out.push(parts.join(" ")));
-vm.register("hostName", () => "web");
-vm.register("nowMs", () => Date.now());
-vm.register("repeat", (s, n) => s.repeat(n));
+vm.register("hostName", () => "web", "()->str");
+vm.register("nowMs", () => Date.now(), "()->int");
+vm.register("repeat", (s, n) => s.repeat(n), "(str,int)->str");
 
 vm.writeFile("prelude.sl", `
     extern func print(s: str);
@@ -31,4 +31,28 @@ if (out.length !== 4 || !out[0].includes("web") || out[1] !== "repeat: ababab") 
     console.error("SMOKE TEST FAILED");
     process.exit(1);
 }
+out.length = 0;
+vm.writeFile("viahost.sl", `
+    import host;
+    func main() {
+        print("host says " + host.hostName() + ", " + host.repeat("ab", 2));
+    }
+`);
+vm.run("viahost.sl");
+if (out.length !== 1 || out[0] !== "host says web, abab") {
+    console.error("SMOKE TEST FAILED: import host gave", JSON.stringify(out));
+    process.exit(1);
+}
+
+vm.writeFile("badhost.sl", `
+    import host;
+    func main() { print(host.repeat(5, "x")); }
+`);
+let rejected = "";
+try { vm.run("badhost.sl"); } catch (e) { rejected = e.message; }
+if (!rejected.includes("expected `str`, found `int`")) {
+    console.error("SMOKE TEST FAILED: a wrong host call was not rejected:", rejected);
+    process.exit(1);
+}
+
 console.log("SMOKE TEST OK");

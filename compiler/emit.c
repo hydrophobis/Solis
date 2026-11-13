@@ -65,12 +65,17 @@ uint16_t bc_add_str(bc_program *p, const char *s, size_t n) {
     return i;
 }
 
-uint16_t bc_add_native(bc_program *p, const char *name) {
+uint16_t bc_add_native(bc_program *p, const char *name, const char *sig) {
     void *hit = map_get(&p->native_map, name);
-    if (hit) return UNSLOT(hit);
+    if (hit) {
+        uint16_t j = UNSLOT(hit);
+        if (sig && !p->native_sigs.at[j]) p->native_sigs.at[j] = sig;
+        return j;
+    }
 
     uint16_t i = (uint16_t)p->natives.len;
     vec_push(p->a, &p->natives, name);
+    vec_push(p->a, &p->native_sigs, sig);
     map_put(&p->native_map, name, SLOT(i));
     return i;
 }
@@ -148,6 +153,10 @@ uint8_t *bc_serialize(bc_program *p, size_t *len_out) {
         size_t n = strlen(p->natives.at[i]);
         ob_u16(&b, (uint16_t)n);
         ob_push(&b, p->natives.at[i], n);
+        const char *sig = p->native_sigs.at[i];
+        size_t sn = sig ? strlen(sig) : 0;
+        ob_u16(&b, (uint16_t)sn);
+        if (sn) ob_push(&b, sig, sn);
     }
 
     ob_u16(&b, p->nglobals);

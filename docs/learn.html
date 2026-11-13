@@ -286,15 +286,39 @@ func main() {
 
     <h2 id="host">Talking to the host</h2>
     <p>
-      <code>extern func</code> declares a function the host provides.
-      That's the entire sandbox: a script reaches exactly what's registered
-      and nothing else — no ambient filesystem, no network, no clock, unless
-      the embedder hands one over. This playground registers
-      <code>hostName</code> and <code>roll</code> just so this example has
+      The host is the application that embeds Solis. A script reaches exactly
+      what the host registered and nothing else: no ambient filesystem, no
+      network, no clock, unless the embedder hands one over. The easy way to
+      call it is <code>import host;</code>, which gives the script a module
+      holding every function the host registered, with the types it registered
+      them with. This playground registers <code>hostName</code>,
+      <code>roll</code> and <code>nowMs</code> just so this example has
       something to call.
     </p>
     <div class="example" data-editable>
       <div class="example-head"><span>host.sl</span><button class="run-btn">▶ Run</button></div>
+      <textarea class="code-edit" rows="8" spellcheck="false">import host;
+
+func main() {
+    print("running on ${host.hostName()}");
+    let n = host.roll(6);
+    print("rolled a ${n}");
+}</textarea>
+      <div class="output"></div>
+    </div>
+    <p>
+      The module is written from the host's registered types, so the compiler
+      checks every call. Change <code>host.roll(6)</code> to
+      <code>host.roll("six")</code> and run it: that's a compile error, not a
+      surprise at runtime. The native <code>solis</code> command prints what it
+      offers with <code>solis --show-host</code>.
+    </p>
+    <p>
+      A script can also declare the functions it calls itself with
+      <code>extern func</code>:
+    </p>
+    <div class="example" data-editable>
+      <div class="example-head"><span>externs.sl</span><button class="run-btn">▶ Run</button></div>
       <textarea class="code-edit" rows="6" spellcheck="false">extern func hostName(): str;
 extern func roll(sides: int): int;
 
@@ -305,9 +329,12 @@ func main() {
       <div class="output"></div>
     </div>
     <p>
-      In a real embedding, a <code>prelude.sl</code> file sitting beside the
-      scripts declares every extern once, so individual plugins don't repeat
-      the host's whole API just to call three functions from it.
+      That works too. The difference is that the script and the host now each
+      state the type, and the program won't load if they disagree. In a real
+      embedding a <code>prelude.sl</code> file sitting beside the scripts can
+      declare the externs once, so individual plugins don't repeat the host's
+      API, though <code>import host;</code> is the better fit when the host
+      registers its functions with signatures.
     </p>
 
     <h2 id="status">What's solid, what's in progress</h2>
@@ -319,7 +346,7 @@ func main() {
       <tr><th>Area</th><th>Status</th></tr>
       <tr><td>Core language — functions, control flow, structs, enums, exhaustive switch, modules</td><td><span class="pill pill-ok">solid</span></td></tr>
       <tr><td>Standard library — <code>math</code>, <code>strings</code>, and the batteries (<code>io</code>/<code>fs</code>/<code>os</code>/<code>time</code>/<code>rand</code>) in a native build</td><td><span class="pill pill-ok">solid</span></td></tr>
-      <tr><td>Host boundary — <code>extern func</code>, the prelude mechanism</td><td><span class="pill pill-ok">solid</span></td></tr>
+      <tr><td>Host boundary: <code>import host;</code>, <code>extern func</code>, signature checks at load, the prelude mechanism</td><td><span class="pill pill-ok">solid</span></td></tr>
       <tr><td><code>null</code> and reference types</td><td><span class="pill pill-ok">solid</span></td></tr>
       <tr><td>Generics, interfaces, <code>weak</code>, <code>arena</code> blocks</td><td><span class="pill pill-cut">removed</span></td></tr>
     </table>

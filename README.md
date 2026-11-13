@@ -39,10 +39,15 @@ solis script.slb                # run a compiled image
 solis --check script.sl         # type check only, don't run
 ```
 
-Run `solis --help` for the full option list. A host embeds `runtime/` as a
-static library (`make lib`) and registers native functions for scripts to call
-through `extern func` declarations. See [`runtime/example.cpp`](runtime/example.cpp)
-and [`examples/host.sl`](examples/host.sl).
+Run `solis --help` for the full option list.
+
+## Embedding
+
+A host links the VM from `runtime/` and registers native functions, with signatures, that scripts reach through `import host;`. The compiler checks every call against the registered types. A host can run precompiled `.slb` images, or link the compiler too and accept `.sl` source.
+
+- [Embedding guide](docs/embedding.md): what to link, how to run a script, writing natives, ownership rules, sandboxing and errors.
+- [`examples/embed/`](examples/embed): `build.cpp` compiles to `.slb`, `interpret.cpp` and `minimal.c` run from source (C++ and C), and `run_image.cpp` runs a precompiled image. Build them with `make -C examples/embed` or `bloomery embed`.
+- [`runtime/example.cpp`](runtime/example.cpp) and [`examples/host.sl`](examples/host.sl) are the original precompiled-script example.
 
 ## Layout
 

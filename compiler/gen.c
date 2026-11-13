@@ -83,6 +83,27 @@ static void gerr(gen *G, span at, const char *help, const char *msg) {
     G->diags->at[G->diags->len - 1].module = G->current;
 }
 
+static const char *native_sig(gen *G, const char *q) {
+    fn_sig *sig = (fn_sig *)map_get(&G->sigs, q);
+    if (!sig) return NULL;
+    const char *out = "(";
+    for (int i = 0; i < sig->params.len; i++)
+        out = arena_printf(G->a, "%s%s%s", out, i ? "," : "", ty_show(G->a, sig->params.at[i].t));
+    return arena_printf(G->a, "%s)->%s", out, ty_show(G->a, sig->ret));
+}
+
+// externs that share a name share one native, so their signatures must match
+static uint16_t native_slot(gen *G, const char *name, const char *q, span at) {
+    name = intern_z(G->in, name);
+    const char *sig = q ? native_sig(G, q) : NULL;
+    void *hit = map_get(&G->prog->native_map, name);
+    const char *have = hit ? G->prog->native_sigs.at[UNSLOT(hit)] : NULL;
+    if (sig && have && strcmp(sig, have) != 0)
+        gerr(G, at, "give both declarations the same signature, or rename one of them",
+             arena_printf(G->a, "`%s` is declared as %s here but as %s elsewhere", name, sig, have));
+    return bc_add_native(G->prog, name, sig);
+}
+
 static const char *qualify(gen *G, const char *name) {
     const char *dot = strchr(name, '.');
     if (dot) {
@@ -255,7 +276,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
                 // runtime registers it that way; a host extern does not.
                 const char *nn = stdlib_source(chain) ? q : name;
                 em_op(e, OP_NATIVE);
-                em_u16(e, bc_add_native(G->prog, intern_z(G->in, nn)));
+                em_u16(e, native_slot(G, nn, q, at));
                 em_u8(e, (uint8_t)args->len);
                 return sig_ret(G, q);
             }
@@ -368,7 +389,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
             if (i == 0) arg_ty = t;
         }
         em_op(e, OP_NATIVE);
-        em_u16(e, bc_add_native(G->prog, intern_z(G->in, name)));
+        em_u16(e, native_slot(G, name, NULL, x->at));
         em_u8(e, (uint8_t)args->len);
         if (strcmp(name, "print") == 0 || strcmp(name, "reverse") == 0 ||
             strcmp(name, "insertAt") == 0 || strcmp(name, "sort") == 0) return ty_void();
@@ -400,7 +421,7 @@ static ty *gen_call(gen *G, expr *x, emitter *e) {
         const char *home = dot ? arena_strndup(G->a, q, (size_t)(dot - q)) : NULL;
         const char *nn = (home && stdlib_source(home)) ? q : name;
         em_op(e, OP_NATIVE);
-        em_u16(e, bc_add_native(G->prog, intern_z(G->in, nn)));
+        em_u16(e, native_slot(G, nn, q, at));
         em_u8(e, (uint8_t)args->len);
         return sig_ret(G, q);
     }
@@ -480,7 +501,7 @@ static ty *gen_binary(gen *G, expr *x, emitter *e) {
     // fall back to runtime-tag equality instead of silently defaulting wrong.
     if (t->kind == TK_PARAM && (op == OP_EQ || op == OP_NE)) {
         em_op(e, OP_NATIVE);
-        em_u16(e, bc_add_native(G->prog, intern_z(G->in, " eq")));
+        em_u16(e, bc_add_native(G->prog, intern_z(G->in, " eq"), NULL));
         em_u8(e, 2);
         if (op == OP_NE) em_op(e, OP_NOT);
         return ty_bool();

@@ -40,8 +40,9 @@ static void render_diags(const loaded *l, const diag_vec *diags, const char *pat
     free(buf);
 }
 
+// vm supplies the source of the `host` module
 EMSCRIPTEN_KEEPALIVE
-int solis_compile(const char *path, const char *prelude_path) {
+int solis_compile(void *vm, const char *path, const char *prelude_path) {
     free(g_image);
     g_image = NULL;
     g_image_len = 0;
@@ -54,7 +55,8 @@ int solis_compile(const char *path, const char *prelude_path) {
     diag_vec diags;
     memset(&diags, 0, sizeof diags);
 
-    loaded *l = module_load(&a, in, path, prelude_path, &diags);
+    char *host = vm ? sl_declarations((const sl_vm *)vm) : NULL;
+    loaded *l = module_load(&a, in, path, prelude_path, host, &diags);
 
     bc_program *prog = NULL;
     if (diags.len == 0) {
@@ -63,13 +65,15 @@ int solis_compile(const char *path, const char *prelude_path) {
     }
 
     if (diags.len || !prog) {
-        render_diags(l, &diags, path);
+        render_diags(l, &diags, path);   // host must outlive rendering: diagnostics point into it
+        free(host);
         arena_free(&a);
         return 1;
     }
 
     size_t len = 0;
     uint8_t *bytes = bc_serialize(prog, &len);
+    free(host);
     arena_free(&a);
     if (!bytes) { set_err("codegen produced no image"); return 1; }
 
@@ -163,7 +167,8 @@ static const sl_native_fn trampolines[SOLIS_NATIVE_POOL] = {
 // Binds `name` to JS dispatch slot `id` (0..SOLIS_NATIVE_POOL-1). The JS
 // wrapper owns which id maps to which callback.
 EMSCRIPTEN_KEEPALIVE
-int solis_register(void *vm, const char *name, int id) {
+int solis_register(void *vm, const char *name, int id, const char *sig) {
     if (id < 0 || id >= SOLIS_NATIVE_POOL) return 0;
+    if (sig && *sig) return sl_register_sig((sl_vm *)vm, name, sig, trampolines[id]) ? 1 : 0;
     return sl_register((sl_vm *)vm, name, trampolines[id]) ? 1 : 0;
 }

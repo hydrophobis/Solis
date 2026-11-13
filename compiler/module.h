@@ -38,8 +38,11 @@ typedef struct {
 // `prelude_path` picks the ambient declarations: NULL looks for prelude.sl
 // beside the entry file, "" turns the mechanism off, anything else is used
 // as given.
+//
+// `host_src` is the source `import host;` resolves to, or NULL. It takes
+// precedence over a host.sl on disk.
 loaded *module_load(arena *a, sl_interner *in, const char *entry_path,
-                    const char *prelude_path, diag_vec *diags);
+                    const char *prelude_path, const char *host_src, diag_vec *diags);
 
 module *module_find(const loaded *l, const char *name);
 

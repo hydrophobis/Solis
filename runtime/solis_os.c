@@ -22,6 +22,10 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#if !defined(S_ISDIR) && defined(_S_IFMT)
+#  define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+
 #ifdef _WIN32
 #  include <direct.h>
 #  include <windows.h>
@@ -201,7 +205,7 @@ static sl_value fs_is_dir(sl_vm *vm, int argc, sl_value *argv) {
     struct stat st;
     if (!want_path(vm, argc, argv, 0, "fs.isDir expects a path", path)) return sl_void();
     if (!stat_path(path, &st)) return sl_bool(false);
-    return sl_bool((st.st_mode & S_IFMT) == S_IFDIR);
+    return sl_bool(S_ISDIR(st.st_mode));
 }
 
 static sl_value fs_size(sl_vm *vm, int argc, sl_value *argv) {
@@ -216,7 +220,7 @@ static sl_value fs_remove(sl_vm *vm, int argc, sl_value *argv) {
     char path[PATH_CAP];
     if (!want_path(vm, argc, argv, 0, "fs.remove expects a path", path)) return sl_void();
     struct stat st;
-    if (stat_path(path, &st) && (st.st_mode & S_IFMT) == S_IFDIR)
+    if (stat_path(path, &st) && S_ISDIR(st.st_mode))
         return sl_bool(rmdir_(path) == 0);
     return sl_bool(remove(path) == 0);
 }

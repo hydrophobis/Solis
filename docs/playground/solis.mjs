@@ -80,12 +80,18 @@ export class Solis {
     // Registers a JS function as a Solis extern. `fn` receives plain JS
     // values (number/boolean/string/undefined) and returns one of those;
     // throwing fails the script's native call with the thrown message.
-    register(name, fn) {
+    //
+    // `sig` is the signature scripts see, like "(str,int)->str" or "()->()"
+    // for no arguments and no result. With one, `import host;` offers the
+    // function with those types, and a script that declares it differently
+    // fails to load. Without one the function can only be reached by a script
+    // that declares it as `extern func`, and nothing checks the types.
+    register(name, fn, sig = null) {
         const id = this._slots.indexOf(null);
         if (id < 0) throw new Error(`Solis: native pool exhausted (max ${NATIVE_POOL})`);
         this._slots[id] = fn;
         if (!this.core.ccall("solis_register", "number",
-                ["number", "string", "number"], [this.vm, name, id])) {
+                ["number", "string", "number", "string"], [this.vm, name, id, sig])) {
             throw new Error(`Solis: could not register '${name}'`);
         }
     }
@@ -102,7 +108,7 @@ export class Solis {
     // disable it, or a path to use explicitly.
     compile(path, preludePath = null) {
         const rc = this.core.ccall("solis_compile", "number",
-            ["string", "string"], [path, preludePath]);
+            ["number", "string", "string"], [this.vm, path, preludePath]);
         if (rc !== 0) throw new Error(this.core.ccall("solis_last_error", "string", [], []));
 
         const ptr = this.core.ccall("solis_image_ptr", "number", [], []);

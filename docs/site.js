@@ -12,9 +12,9 @@ let nextFile = 0;
 // examples/plugins in the main repo: a real embedder registers its own set.
 function registerDemoHost(vm, print) {
     vm.register("print", print);
-    vm.register("hostName", () => "playground");
-    vm.register("nowMs", () => Date.now());
-    vm.register("roll", (sides) => 1 + Math.floor(Math.random() * sides));
+    vm.register("hostName", () => "playground", "()->str");
+    vm.register("nowMs", () => Date.now(), "()->int");
+    vm.register("roll", (sides) => 1 + Math.floor(Math.random() * sides), "(int)->int");
 }
 
 // Runs `source` to completion, returning { ok, lines, error }. Never throws.

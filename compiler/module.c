@@ -50,6 +50,7 @@ typedef struct {
     loaded      *out;
     diag_vec    *diags;
     const char  *dir;
+    const char  *host_src;
     // The import stack, so a cycle can be named as a chain.
     VEC(const char *) stack;
 } loader;
@@ -77,7 +78,12 @@ static void load_one(loader *L, const char *name, const char *path) {
     const char *src = NULL;
     size_t src_len = 0;
     const char *embedded = stdlib_source(name);
-    if (embedded && !file_exists(path)) {
+    // the entry file is never the host module, even when it is named host.sl
+    if (L->host_src && L->stack.len > 0 && strcmp(name, "host") == 0) {
+        src = L->host_src;
+        src_len = strlen(src);
+        path = "<host>";
+    } else if (embedded && !file_exists(path)) {
         src = embedded;
         src_len = strlen(embedded);
     } else {
@@ -185,7 +191,7 @@ static void split_path(arena *a, const char *path, const char **dir, const char 
 }
 
 loaded *module_load(arena *a, sl_interner *in, const char *entry_path,
-                    const char *prelude_path, diag_vec *diags) {
+                    const char *prelude_path, const char *host_src, diag_vec *diags) {
     loaded *out = NEW(a, loaded);
 
     const char *dir;
@@ -200,6 +206,7 @@ loaded *module_load(arena *a, sl_interner *in, const char *entry_path,
     L.out = out;
     L.diags = diags;
     L.dir = dir;
+    L.host_src = host_src;
 
     load_one(&L, out->root, entry_path);
 

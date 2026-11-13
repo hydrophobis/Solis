@@ -110,9 +110,10 @@ struct sl_vm {
     sl_const *consts;       uint16_t nconsts;
     sl_func  *funcs;        uint16_t nfuncs;
     char    **native_names; uint16_t nnative_names;
+    char    **native_sigs;
     sl_value *globals;      uint16_t nglobals;
 
-    struct { char *name; sl_native_fn fn; } registry[SL_NATIVES_MAX];
+    struct { char *name; char *sig; sl_native_fn fn; } registry[SL_NATIVES_MAX];
     int nregistered;
     int *native_bind;
 
@@ -124,7 +125,7 @@ struct sl_vm {
     int nframes;
 
     int64_t live;       // heap objects alive, for leak checks
-    char err[256];
+    char err[1024];
     bool failed;
 };
 
@@ -814,23 +815,205 @@ void sl_free(sl_vm *vm) {
     free(vm->funcs);
     for (uint16_t i = 0; i < vm->nglobals; i++) sl_release(vm, vm->globals[i]);
     free(vm->globals);
-    for (uint16_t i = 0; i < vm->nnative_names; i++) free(vm->native_names[i]);
+    for (uint16_t i = 0; i < vm->nnative_names; i++) {
+        free(vm->native_names[i]);
+        if (vm->native_sigs) free(vm->native_sigs[i]);
+    }
     free(vm->native_names);
+    free(vm->native_sigs);
     free(vm->native_bind);
-    for (int i = 0; i < vm->nregistered; i++) free(vm->registry[i].name);
+    for (int i = 0; i < vm->nregistered; i++) { free(vm->registry[i].name); free(vm->registry[i].sig); }
     free(vm);
 }
 
-bool sl_register(sl_vm *vm, const char *name, sl_native_fn fn) {
-    if (vm->nregistered >= SL_NATIVES_MAX) return false;
-    size_t n = strlen(name);
+static char *dup_z(const char *z) {
+    size_t n = strlen(z);
     char *copy = (char *)malloc(n + 1);
-    if (!copy) return false;
-    memcpy(copy, name, n + 1);
+    if (copy) memcpy(copy, z, n + 1);
+    return copy;
+}
+
+static bool register_native(sl_vm *vm, const char *name, const char *sig, sl_native_fn fn) {
+    if (vm->nregistered >= SL_NATIVES_MAX) return false;
+    char *copy = dup_z(name);
+    char *sig_copy = sig ? dup_z(sig) : NULL;
+    if (!copy || (sig && !sig_copy)) { free(copy); free(sig_copy); return false; }
     vm->registry[vm->nregistered].name = copy;
+    vm->registry[vm->nregistered].sig = sig_copy;
     vm->registry[vm->nregistered].fn = fn;
     vm->nregistered++;
     return true;
+}
+
+bool sl_register(sl_vm *vm, const char *name, sl_native_fn fn) {
+    return register_native(vm, name, NULL, fn);
+}
+
+bool sl_register_sig(sl_vm *vm, const char *name, const char *sig, sl_native_fn fn) {
+    return register_native(vm, name, sig, fn);
+}
+
+typedef struct { char *p; size_t n, cap; } sbuf;
+
+static bool sb_put(sbuf *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (cap < b->n + n + 1) cap *= 2;
+        char *q = (char *)realloc(b->p, cap);
+        if (!q) return false;
+        b->p = q;
+        b->cap = cap;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+    return true;
+}
+
+static bool sb_puts(sbuf *b, const char *s) { return sb_put(b, s, strlen(s)); }
+
+static bool is_ident_start(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+static bool is_ident_char(char c) { return is_ident_start(c) || (c >= '0' && c <= '9'); }
+
+// user structs and enums belong to the script that defines them; a host module cannot spell them
+static bool plain_type(const char *t, size_t n) {
+    for (size_t i = 0; i < n;) {
+        if (is_ident_start(t[i])) {
+            size_t j = i;
+            while (j < n && (is_ident_char(t[j]) || t[j] == '.')) j++;
+            size_t len = j - i;
+            bool ok = (len == 3 && memcmp(t + i, "int", 3) == 0) || (len == 5 && memcmp(t + i, "float", 5) == 0) ||
+                      (len == 4 && memcmp(t + i, "bool", 4) == 0) || (len == 3 && memcmp(t + i, "str", 3) == 0);
+            if (!ok) return false;
+            i = j;
+        } else if (t[i] == '[' || t[i] == ']' || t[i] == '{' || t[i] == '}' || t[i] == ':' || t[i] == ' ') {
+            i++;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+// "(str,int)->str" -> "extern func name(p0: str, p1: int): str;"; false if malformed or not plain
+static bool decl_from_sig(sbuf *out, const char *name, const char *sig) {
+    const char *p = sig;
+    while (*p == ' ') p++;
+    if (*p != '(') return false;
+    const char *open = p++;
+    int depth = 1;
+    const char *close = NULL;
+    for (const char *q = p; *q; q++) {
+        if (*q == '(' || *q == '[' || *q == '{') depth++;
+        else if (*q == ')' || *q == ']' || *q == '}') {
+            if (--depth == 0) { close = q; break; }
+        }
+    }
+    if (!close) return false;
+    const char *arrow = close + 1;
+    while (*arrow == ' ') arrow++;
+    if (arrow[0] != '-' || arrow[1] != '>') return false;
+    const char *ret = arrow + 2;
+    while (*ret == ' ') ret++;
+    size_t ret_len = strlen(ret);
+    while (ret_len && ret[ret_len - 1] == ' ') ret_len--;
+    if (!ret_len) return false;
+    bool no_result = ret_len == 2 && memcmp(ret, "()", 2) == 0;
+    if (!no_result && !plain_type(ret, ret_len)) return false;
+    (void)open;
+
+    sbuf tmp = { 0 };
+    bool ok = sb_puts(&tmp, "extern func ") && sb_puts(&tmp, name) && sb_puts(&tmp, "(");
+    int index = 0;
+    const char *start = p;
+    depth = 0;
+    for (const char *q = p;; q++) {
+        bool end = q == close;
+        if (!end && (*q == '[' || *q == '{' || *q == '(')) depth++;
+        else if (!end && (*q == ']' || *q == '}' || *q == ')')) depth--;
+        if (end || (*q == ',' && depth == 0)) {
+            size_t len = (size_t)(q - start);
+            while (len && *start == ' ') { start++; len--; }
+            while (len && start[len - 1] == ' ') len--;
+            if (len) {
+                char label[24];
+                snprintf(label, sizeof label, "%sp%d: ", index ? ", " : "", index);
+                if (!plain_type(start, len) || !sb_puts(&tmp, label) || !sb_put(&tmp, start, len)) { ok = false; break; }
+                index++;
+            }
+            start = q + 1;
+        }
+        if (end) break;
+    }
+    ok = ok && sb_puts(&tmp, ")");
+    if (ok && !no_result) ok = sb_puts(&tmp, ": ") && sb_put(&tmp, ret, ret_len);
+    ok = ok && sb_puts(&tmp, ";\n") && sb_put(out, tmp.p, tmp.n);
+    free(tmp.p);
+    return ok;
+}
+
+char *sl_declarations(const sl_vm *vm) {
+    sbuf b = { 0 };
+    bool ok = sb_puts(&b, "// Generated from the natives this host registered with a signature.\n");
+    for (int i = 0; ok && i < vm->nregistered; i++) {
+        const char *name = vm->registry[i].name;
+        const char *sig = vm->registry[i].sig;
+        if (!sig || !is_ident_start(name[0])) continue;
+        bool plain = true;
+        for (const char *c = name; *c; c++) if (!is_ident_char(*c)) plain = false;
+        if (!plain) continue;
+        bool shadowed = false;      // the last registration of a name wins
+        for (int j = i + 1; j < vm->nregistered; j++)
+            if (strcmp(vm->registry[j].name, name) == 0) shadowed = true;
+        if (shadowed) continue;
+        if (!decl_from_sig(&b, name, sig)) {
+            ok = sb_puts(&b, "// `") && sb_puts(&b, name) &&
+                 sb_puts(&b, "` is not declared here: its signature names a type only a script can define.\n");
+        }
+    }
+    if (!ok) { free(b.p); return NULL; }
+    return b.p;
+}
+
+// ignores spaces: {str:int} equals {str: int}
+static bool sig_equal(const char *a, const char *b) {
+    for (;;) {
+        while (*a == ' ') a++;
+        while (*b == ' ') b++;
+        if (*a != *b) return false;
+        if (!*a) return true;
+        a++; b++;
+    }
+}
+
+// reports every unresolved or mismatched native, not just the first
+static sl_result link_check(sl_vm *vm) {
+    enum { SHOWN = 6 };
+    int problems = 0;
+    size_t used = 0;
+    used += (size_t)snprintf(vm->err, sizeof vm->err, "cannot link the program to this host:");
+    for (uint16_t i = 0; i < vm->nnative_names; i++) {
+        int j = vm->native_bind[i];
+        const char *name = vm->native_names[i];
+        const char *want = vm->native_sigs[i] ? vm->native_sigs[i] : "";
+        const char *have = j >= 0 ? vm->registry[j].sig : NULL;
+        char line[320] = "";
+        if (j < 0)
+            snprintf(line, sizeof line, "\n  `%s`%s%s is declared extern but the host did not register it",
+                     name, *want ? " " : "", want);
+        else if (*want && have && !sig_equal(want, have))
+            snprintf(line, sizeof line, "\n  `%s`: the script declares %s but the host registered %s",
+                     name, want, have);
+        else
+            continue;
+        problems++;
+        if (problems <= SHOWN && used < sizeof vm->err) used += (size_t)snprintf(vm->err + used, sizeof vm->err - used, "%s", line);
+    }
+    if (!problems) { vm->err[0] = 0; return SL_OK; }
+    if (problems > SHOWN && used < sizeof vm->err)
+        snprintf(vm->err + used, sizeof vm->err - used, "\n  ... and %d more", problems - SHOWN);
+    vm->failed = true;
+    return SL_ERR_LINK;
 }
 
 sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
@@ -842,8 +1025,8 @@ sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
     }
     r.p += 4;
     uint16_t version = rd_u16(&r);
-    if (version != 5) {
-        vm_error(vm, "bytecode version %u, this runtime understands 5", version);
+    if (version != 6) {
+        vm_error(vm, "bytecode version %u, this runtime understands 6", version);
         return SL_ERR_BADFILE;
     }
 
@@ -868,11 +1051,14 @@ sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
 
     vm->nnative_names = rd_u16(&r);
     vm->native_names = (char **)calloc(vm->nnative_names ? vm->nnative_names : 1, sizeof(char *));
+    vm->native_sigs  = (char **)calloc(vm->nnative_names ? vm->nnative_names : 1, sizeof(char *));
     vm->native_bind  = (int  *)calloc(vm->nnative_names ? vm->nnative_names : 1, sizeof(int));
-    if (!vm->native_names || !vm->native_bind) return SL_ERR_NOMEM;
+    if (!vm->native_names || !vm->native_sigs || !vm->native_bind) return SL_ERR_NOMEM;
     for (uint16_t i = 0; i < vm->nnative_names && !r.bad; i++) {
         uint16_t n = rd_u16(&r);
         vm->native_names[i] = rd_bytes(&r, n);
+        uint16_t sn = rd_u16(&r);
+        vm->native_sigs[i] = rd_bytes(&r, sn);
         vm->native_bind[i] = -1;
     }
 
@@ -909,7 +1095,7 @@ sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
         for (int j = vm->nregistered - 1; j >= 0; j--)
             if (strcmp(vm->native_names[i], vm->registry[j].name) == 0) { vm->native_bind[i] = j; break; }
 
-    return SL_OK;
+    return link_check(vm);
 }
 
 static int16_t read_i16(uint8_t **ip) {

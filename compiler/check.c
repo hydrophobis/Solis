@@ -1456,8 +1456,11 @@ static ty *type_member(checker *C, const char *head, const char *name, span at, 
             *found = false;
             return NULL;
         }
-        cerr_help(C, at, arena_printf(C->a, "check what `%s.sl` declares", head),
-                  arena_printf(C->a, "module `%s` has no `%s`", head, name));
+        // host has no source file
+        const char *help = strcmp(head, "host") == 0
+            ? "`host` has only the natives the embedder registered with a signature"
+            : arena_printf(C->a, "check what `%s.sl` declares", head);
+        cerr_help(C, at, help, arena_printf(C->a, "module `%s` has no `%s`", head, name));
         return ty_error();
     }
 

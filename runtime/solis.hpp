@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <stdexcept>
@@ -295,18 +296,37 @@ public:
 
     // Register a native. Any callable with signature
     // Value(Vm &, Args) works, capturing lambdas included.
+    //
+    // `signature`, like "(str,int)->str", is checked against the script's extern
+    // at load. nullptr leaves the native unchecked.
     template <class F>
-    void define(const std::string &name, F &&fn) {
+    void define(const std::string &name, const char *signature, F &&fn) {
         const int slot = static_cast<int>(natives_.size());
         if (slot >= detail::kMaxNatives) {
             throw Error("a Solis VM accepts at most " +
                         std::to_string(detail::kMaxNatives) + " natives");
         }
         natives_.emplace_back(std::forward<F>(fn));
-        if (!sl_register(vm_, name.c_str(), detail::entries()[slot])) {
+        const bool ok = signature
+            ? sl_register_sig(vm_, name.c_str(), signature, detail::entries()[slot])
+            : sl_register(vm_, name.c_str(), detail::entries()[slot]);
+        if (!ok) {
             natives_.pop_back();
             throw Error("cannot register native `" + name + "`");
         }
+    }
+
+    template <class F>
+    void define(const std::string &name, F &&fn) {
+        define(name, static_cast<const char *>(nullptr), std::forward<F>(fn));
+    }
+
+    std::string declarations() const {
+        char *z = sl_declarations(vm_);
+        if (!z) throw Error("out of memory");
+        std::string out(z);
+        std::free(z);
+        return out;
     }
 
     // How many more natives this VM will take. Asks the runtime rather than

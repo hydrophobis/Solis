@@ -9,7 +9,8 @@
 //   consts[]  tag u8 then payload: 0 = i64, 1 = f64,
 //             2 = u32 length followed by that many UTF-8 bytes
 //   nnatives  u16
-//   natives[] u16 length then that many bytes
+//   natives[] u16 name length, name, u16 signature length, signature
+//             (empty for the runtime's own intrinsics)
 //   nglobals  u16
 //   nfuncs    u16
 //   funcs[]   u16 name length, name, u8 arity, u16 nslots,
@@ -22,7 +23,7 @@
 #include "common.h"
 
 #define SL_MAGIC   "SLBC"
-#define SL_VERSION 5
+#define SL_VERSION 6
 
 typedef enum {
     // Push a small integer encoded in the instruction itself.
@@ -124,6 +125,7 @@ typedef struct {
     arena *a;
     VEC(constant)     consts;
     VEC(const char *) natives;
+    VEC(const char *) native_sigs;   // parallel to natives; NULL for an intrinsic
     VEC(bc_func)      funcs;
     uint16_t          entry;
     uint16_t          nglobals;
@@ -139,7 +141,8 @@ void bc_init(bc_program *p, arena *a);
 uint16_t bc_add_int(bc_program *p, int64_t v);
 uint16_t bc_add_float(bc_program *p, double v);
 uint16_t bc_add_str(bc_program *p, const char *s, size_t n);
-uint16_t bc_add_native(bc_program *p, const char *name);
+// an existing slot keeps its index and gains `sig` if it had none
+uint16_t bc_add_native(bc_program *p, const char *name, const char *sig);
 
 // Serialize to a freshly allocated buffer.
 uint8_t *bc_serialize(bc_program *p, size_t *len_out);

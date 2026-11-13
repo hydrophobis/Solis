@@ -66,13 +66,22 @@ typedef enum {
     SL_OK = 0,
     SL_ERR_BADFILE,     // not Solis bytecode, or an unknown version
     SL_ERR_RUNTIME,     // the script faulted
-    SL_ERR_NOMEM
+    SL_ERR_NOMEM,
+    SL_ERR_LINK         // unregistered native or signature mismatch
 } sl_result;
 
 sl_vm      *sl_new(void);
 void        sl_free(sl_vm *vm);
 
+// `sig` is spelled like "(str,int)->str", or "()->()" for no arguments and no
+// result. sl_load checks it against the script's extern; sl_register is unchecked.
+bool        sl_register_sig(sl_vm *vm, const char *name, const char *sig, sl_native_fn fn);
 bool        sl_register(sl_vm *vm, const char *name, sl_native_fn fn);
+
+// Source of the `host` module for natives registered with sl_register_sig.
+// Natives without a signature, or whose signature names a user type, are
+// omitted. The result is malloc'd.
+char       *sl_declarations(const sl_vm *vm);
 sl_result   sl_load(sl_vm *vm, const uint8_t *bytes, size_t len);
 sl_result   sl_run(sl_vm *vm);
 
@@ -111,7 +120,7 @@ bool        sl_map_set(sl_vm *vm, sl_value m, sl_value key, sl_value val);
 bool        sl_map_remove(sl_vm *vm, sl_value m, sl_value key, sl_value *out);
 bool        sl_map_pair_at(sl_value m, int64_t i, sl_value *key_out, sl_value *val_out);
 
-// Render any value the way `print` does. Returns a VM-owned string value.
+// the caller owns the result and must sl_release it
 sl_value    sl_to_string(sl_vm *vm, sl_value v);
 
 // How many heap objects are currently alive; for leak checks in tests.

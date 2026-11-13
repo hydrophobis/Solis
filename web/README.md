@@ -52,9 +52,24 @@ the same virtual path with `writeFile()` before `run()`/`compile()`.
 
 ### Native functions
 
-`register(name, fn)` binds a JS function as a Solis `extern`. Arguments
+`register(name, fn, sig)` binds a JS function as a Solis `extern`. Arguments
 arrive as plain `number | boolean | string | undefined`; return one of those
-(or throw, to fail the script's call with your message as the error).
+(or throw, to fail the script's native call with your message as the error).
+
+Pass `sig`, the signature scripts see, like `"(str,int)->str"` (`"()->()"` for
+no arguments and no result). Then a script can `import host;` and call
+`host.name(...)` with no declarations of its own, the compiler checks each call
+against your types, and a script that declares the function as `extern func`
+with different types fails to load. Register without `sig` and the function is
+reachable only through a script's own `extern func`, with nothing checking the
+types.
+
+```js
+vm.register("repeat", (s, n) => s.repeat(n), "(str,int)->str");
+vm.writeFile("main.sl", `import host;
+func main() { print(host.repeat("ab", 3)); }`);
+vm.run("main.sl");
+```
 
 Numbers cross as doubles: exact integers up to 2^53, same as any other JS
 number. Arrays, structs and variants aren't marshaled yet — round-trip those

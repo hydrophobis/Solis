@@ -22,6 +22,7 @@ static void usage(void) {
             "  --prelude <file>  host declarations every module can see\n"
             "  --no-prelude      ignore a prelude.sl sitting beside the script\n"
             "  --check-leaks     report live objects after the run\n"
+            "  --show-host       print the `host` module scripts can import, and exit\n"
             "  --tokens          token and diagnostic counts only\n"
             "  --stats           report what the image contains\n"
             "  --version         print the version\n"
@@ -108,19 +109,22 @@ static uint8_t *read_whole(const char *path, size_t *len_out) {
     return buf;
 }
 
-static int run_image(const uint8_t *bytes, size_t len, bool check_leaks,
-                     int sargc, char **sargv) {
+static sl_vm *host_vm(int sargc, char **sargv) {
     sl_vm *vm = sl_new();
-    if (!vm) return 1;
+    if (!vm) return NULL;
 
     sl_open_std(vm);
     sl_open_os(vm, sargc, sargv);
 
     sl_register(vm, "print", native_print);
-    sl_register(vm, "nowMs", native_now_ms);
-    sl_register(vm, "hostName", native_host_name);
-    sl_register(vm, "repeat", native_repeat);
+    sl_register_sig(vm, "nowMs", "()->int", native_now_ms);
+    sl_register_sig(vm, "hostName", "()->str", native_host_name);
+    sl_register_sig(vm, "repeat", "(str,int)->str", native_repeat);
+    return vm;
+}
 
+// takes ownership of vm
+static int run_image(sl_vm *vm, const uint8_t *bytes, size_t len, bool check_leaks) {
     sl_result rc = sl_load(vm, bytes, len);
     if (rc != SL_OK) {
         fprintf(stderr, "load error: %s\n", sl_error(vm));
@@ -156,6 +160,7 @@ int main(int argc, char **argv) {
     bool want_stats = false;
     bool want_check = false;
     bool check_leaks = false;
+    bool show_host = false;
     int  script_argc = 0;
     char **script_argv = argv;
 
@@ -165,6 +170,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--no-prelude") == 0) no_prelude = true;
         else if (strcmp(argv[i], "--check") == 0) want_check = true;
         else if (strcmp(argv[i], "--check-leaks") == 0) check_leaks = true;
+        else if (strcmp(argv[i], "--show-host") == 0) show_host = true;
         else if (strcmp(argv[i], "--tokens") == 0) want_tokens = true;
         else if (strcmp(argv[i], "--stats") == 0) want_stats = true;
         else if (strcmp(argv[i], "--version") == 0) { printf("solis " VERSION "\n"); return 0; }
@@ -182,6 +188,16 @@ int main(int argc, char **argv) {
             script_argc = argc - i;
             break;
         }
+    }
+
+    if (show_host) {
+        sl_vm *vm = host_vm(0, NULL);
+        char *decls = vm ? sl_declarations(vm) : NULL;
+        if (!decls) return 1;
+        fputs(decls, stdout);
+        free(decls);
+        sl_free(vm);
+        return 0;
     }
 
     if (!in_path) {
@@ -202,7 +218,9 @@ int main(int argc, char **argv) {
             free(raw);
             return 2;
         }
-        int rc = run_image(raw, raw_len, check_leaks, script_argc, script_argv);
+        sl_vm *vm = host_vm(script_argc, script_argv);
+        if (!vm) { free(raw); return 1; }
+        int rc = run_image(vm, raw, raw_len, check_leaks);
         free(raw);
         return rc;
     }
@@ -236,7 +254,17 @@ int main(int argc, char **argv) {
         fclose(pf);
     }
 
-    loaded *l = module_load(&a, in, in_path, no_prelude ? "" : prelude, &diags);
+    sl_vm *vm = host_vm(script_argc, script_argv);
+    char *host_decls = vm ? sl_declarations(vm) : NULL;
+    if (!vm || !host_decls) {
+        fprintf(stderr, "solis: out of memory\n");
+        if (vm) sl_free(vm);
+        free(host_decls);
+        arena_free(&a);
+        return 1;
+    }
+
+    loaded *l = module_load(&a, in, in_path, no_prelude ? "" : prelude, host_decls, &diags);
 
     uint8_t *bytes = NULL;
     size_t len = 0;
@@ -254,6 +282,8 @@ int main(int argc, char **argv) {
                     if (!f) {
                         fprintf(stderr, "solis: cannot write %s\n", out_path);
                         free(bytes);
+                        sl_free(vm);
+                        free(host_decls);
                         arena_free(&a);
                         return 2;
                     }
@@ -282,24 +312,30 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n%d error(s)%s\n", diags.len,
                 out_path ? "; nothing emitted" : "");
         free(bytes);
+        sl_free(vm);
+        free(host_decls);
         arena_free(&a);
         return 1;
     }
 
     if (want_check) {
         printf("%s: no errors\n", in_path);
+        sl_free(vm);
+        free(host_decls);
         arena_free(&a);
         return 0;
     }
 
+    free(host_decls);
     arena_free(&a);
 
     if (out_path || want_stats) {
         free(bytes);
+        sl_free(vm);
         return 0;
     }
 
-    int rc = run_image(bytes, len, check_leaks, script_argc, script_argv);
+    int rc = run_image(vm, bytes, len, check_leaks);
     free(bytes);
     return rc;
 }

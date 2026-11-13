@@ -13,6 +13,14 @@ build/
 .deps.d
 *.slb
 
+# embedding examples and the C++ runtime example
+examples/embed/obj/
+examples/embed/build
+examples/embed/interpret
+examples/embed/run_image
+examples/embed/minimal
+runtime/solis-run++
+
 # ...but the golden bytecode is the regression floor, so it is tracked.
 !tests/golden/*.slb
 

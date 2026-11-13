@@ -35,16 +35,16 @@ int main(int argc, char **argv) {
             return solis::Value();
         });
 
-        vm.define("nowMs", [](solis::Vm &, solis::Args) {
+        vm.define("nowMs", "()->int", [](solis::Vm &, solis::Args) {
             return solis::Value::integer(
                 static_cast<int64_t>(clock() * 1000.0 / CLOCKS_PER_SEC));
         });
 
-        vm.define("hostName", [](solis::Vm &v, solis::Args) {
+        vm.define("hostName", "()->str", [](solis::Vm &v, solis::Args) {
             return v.string("solis-c");
         });
 
-        vm.define("repeat", [](solis::Vm &v, solis::Args args) {
+        vm.define("repeat", "(str,int)->str", [](solis::Vm &v, solis::Args args) {
             if (args.size() < 2) throw solis::Error("repeat(str, int) wants two arguments");
             std::string_view s = args[0].asString();
             int64_t n = args[1].asInt();

@@ -17,6 +17,7 @@ EXAMPLES=(
     examples/test_demo.sl
     examples/stdlib.sl
     examples/host.sl
+    examples/host_module.sl
     examples/native.sl
     examples/app/main.sl
 )
