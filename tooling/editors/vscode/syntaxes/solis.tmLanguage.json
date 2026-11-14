@@ -1,0 +1,75 @@
+{
+  "name": "Solis",
+  "scopeName": "source.solis",
+  "fileTypes": ["sl"],
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#string" },
+    { "include": "#number" },
+    { "include": "#declaration" },
+    { "include": "#keyword" },
+    { "include": "#type" },
+    { "include": "#builtin" },
+    { "include": "#call" }
+  ],
+  "repository": {
+    "comment": {
+      "patterns": [
+        { "name": "comment.line.double-slash.solis", "match": "//.*$" },
+        { "name": "comment.block.solis", "begin": "/\\*", "end": "\\*/",
+          "patterns": [{ "include": "#nested-comment" }] }
+      ]
+    },
+    "nested-comment": {
+      "name": "comment.block.solis", "begin": "/\\*", "end": "\\*/",
+      "patterns": [{ "include": "#nested-comment" }]
+    },
+    "string": {
+      "name": "string.quoted.double.solis",
+      "begin": "\"", "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.solis", "match": "\\\\." },
+        { "name": "meta.interpolation.solis", "begin": "\\$\\{", "end": "\\}",
+          "beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.solis" } },
+          "endCaptures": { "0": { "name": "punctuation.section.interpolation.end.solis" } },
+          "patterns": [{ "include": "$self" }] }
+      ]
+    },
+    "number": {
+      "patterns": [
+        { "name": "constant.numeric.float.solis", "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9]+)?\\b" },
+        { "name": "constant.numeric.hex.solis", "match": "\\b0[xX][0-9a-fA-F_]+\\b" },
+        { "name": "constant.numeric.integer.solis", "match": "\\b[0-9][0-9_]*\\b" }
+      ]
+    },
+    "declaration": {
+      "patterns": [
+        { "match": "\\b(func)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": { "1": { "name": "keyword.declaration.function.solis" }, "2": { "name": "entity.name.function.solis" } } },
+        { "match": "\\b(struct|enum|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": { "1": { "name": "keyword.declaration.type.solis" }, "2": { "name": "entity.name.type.solis" } } }
+      ]
+    },
+    "keyword": {
+      "patterns": [
+        { "name": "keyword.control.solis", "match": "\\b(if|else|while|for|in|switch|case|default|return|break|continue)\\b" },
+        { "name": "storage.type.solis", "match": "\\b(func|let|var|struct|enum|interface|static|extern|arena|weak|mut)\\b" },
+        { "name": "keyword.control.import.solis", "match": "\\bimport\\b" },
+        { "name": "constant.language.solis", "match": "\\b(true|false|null)\\b" },
+        { "name": "variable.language.this.solis", "match": "\\bthis\\b" }
+      ]
+    },
+    "type": {
+      "name": "support.type.solis",
+      "match": "\\b(int|float|bool|str|void)\\b"
+    },
+    "builtin": {
+      "name": "support.function.builtin.solis",
+      "match": "\\b(print|len|push|pop|sort|reverse|indexOf|contains|removeAt|insertAt|removeKey|keys|values|sqrt|abs)(?=\\s*\\()"
+    },
+    "call": {
+      "name": "entity.name.function.call.solis",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
+    }
+  }
+}

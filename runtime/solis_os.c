@@ -343,6 +343,58 @@ static sl_value os_run(sl_vm *vm, int argc, sl_value *argv) {
     return sl_int((int64_t)rc);
 }
 
+#ifdef _WIN32
+#  define popen_ _popen
+#  define pclose_ _pclose
+#else
+#  define popen_ popen
+#  define pclose_ pclose
+#endif
+
+static int64_t last_status = -1;
+
+// Runs `command` through the shell and returns everything it wrote to its
+// standard output. The status is kept for os.lastStatus.
+static sl_value os_output(sl_vm *vm, int argc, sl_value *argv) {
+    size_t n;
+    const char *p = want_s(vm, argc, argv, 0, "os.output expects a command", &n);
+    if (!p) return sl_void();
+    if (n >= 4096) { sl_fail(vm, "command is too long"); return sl_void(); }
+    char cmd[4096];
+    memcpy(cmd, p, n);
+    cmd[n] = 0;
+    fflush(stdout);
+    last_status = -1;
+    FILE *f = popen_(cmd, "r");
+    if (!f) return sl_cstr(vm, "");
+    size_t cap = 4096, len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { pclose_(f); sl_fail(vm, "out of memory"); return sl_void(); }
+    size_t got;
+    while ((got = fread(buf + len, 1, cap - len, f)) > 0) {
+        len += got;
+        if (len == cap) {
+            char *bigger = (char *)realloc(buf, cap * 2);
+            if (!bigger) { free(buf); pclose_(f); sl_fail(vm, "out of memory"); return sl_void(); }
+            buf = bigger;
+            cap *= 2;
+        }
+    }
+    int rc = pclose_(f);
+#ifndef _WIN32
+    if (rc != -1 && WIFEXITED(rc)) rc = WEXITSTATUS(rc);
+#endif
+    last_status = rc;
+    sl_value out = sl_str(vm, buf, len);
+    free(buf);
+    return out;
+}
+
+static sl_value os_last_status(sl_vm *vm, int argc, sl_value *argv) {
+    (void)vm; (void)argc; (void)argv;
+    return sl_int(last_status);
+}
+
 static int64_t wall_ms(void) {
 #ifdef _WIN32
     FILETIME ft;
@@ -423,6 +475,8 @@ static sl_value rand_real(sl_vm *vm, int argc, sl_value *argv) {
     return sl_float((double)(next_u64() >> 11) * (1.0 / 9007199254740992.0));
 }
 
+#include "solis_net.inc"
+
 void sl_open_os(sl_vm *vm, int argc, char **argv) {
     os_argc = argc;
     os_argv = argv;
@@ -456,6 +510,8 @@ void sl_open_os(sl_vm *vm, int argc, char **argv) {
         { "os.platform",   os_platform },
         { "os.cwd",        os_cwd },
         { "os.run",        os_run },
+        { "os.output",     os_output },
+        { "os.lastStatus", os_last_status },
 
         { "time.nowMs",    time_now_ms },
         { "time.monoMs",   time_mono_ms },
@@ -465,6 +521,8 @@ void sl_open_os(sl_vm *vm, int argc, char **argv) {
         { "rand.seed",     rand_seed },
         { "rand.below",    rand_below },
         { "rand.real",     rand_real },
+
+        NET_NATIVES
     };
     for (size_t i = 0; i < sizeof table / sizeof table[0]; i++)
         sl_register(vm, table[i].name, table[i].fn);

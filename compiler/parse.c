@@ -804,6 +804,17 @@ static str_seg_vec lower_string(parser *P, const str_part_vec *parts, span at) {
                       "invalid expression in interpolation: `%s`", src);
             continue;
         }
+        // The text was lexed on its own, so its positions start at zero. Move
+        // them to where the text really is, so later errors and tools point at
+        // the right place in the file.
+        uint32_t base = parts->at[i].offset;
+        for (int k = 0; k < toks.len; k++) {
+            toks.at[k].at.start += base;
+            toks.at[k].at.end += base;
+            if (toks.at[k].kind == T_STR)
+                for (int q = 0; q < toks.at[k].as.parts.len; q++)
+                    if (toks.at[k].as.parts.at[q].is_expr) toks.at[k].as.parts.at[q].offset += base;
+        }
 
         parser sub;
         sub.toks = toks;

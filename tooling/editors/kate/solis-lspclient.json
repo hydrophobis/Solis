@@ -1,0 +1,10 @@
+{
+  "_comment": "Kate and KDevelop, Linux and Windows. Merge the \"solis\" entry into the \"servers\" object of the LSP Client settings (Settings > Configure Kate > LSP Client > User Server Settings). sl must be on PATH.",
+  "servers": {
+    "solis": {
+      "command": ["sl", "lsp"],
+      "root": "solis.toml",
+      "highlightingModeRegex": "^Solis$"
+    }
+  }
+}

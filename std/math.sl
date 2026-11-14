@@ -28,6 +28,29 @@ extern func sin(x: float): float;
 extern func cos(x: float): float;
 extern func tan(x: float): float;
 extern func atan2(y: float, x: float): float;
+extern func asin(x: float): float;
+extern func acos(x: float): float;
+extern func atan(x: float): float;
+extern func sinh(x: float): float;
+extern func cosh(x: float): float;
+extern func tanh(x: float): float;
+
+extern func log2(x: float): float;
+extern func cbrt(x: float): float;
+extern func hypot(x: float, y: float): float;
+
+// Drops the fractional part but stays a float (`toInt` gives an int).
+extern func trunc(x: float): float;
+
+// The remainder of x / y with the sign of x, like C's fmod. 0.0 when y is 0.
+extern func mod(x: float, y: float): float;
+
+// Not-a-number and infinity, which arithmetic can produce and `==` cannot
+// test for.
+extern func isNaN(x: float): bool;
+extern func isInf(x: float): bool;
+extern func nan(): float;
+extern func inf(): float;
 
 extern func abs(x: float): float;
 extern func absInt(n: int): int;

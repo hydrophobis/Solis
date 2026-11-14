@@ -95,9 +95,54 @@ typedef struct {
     map externs;        // qualified name -> non-NULL marker
 } decls;
 
+// What a name resolved to. The checker records one of these for every use it
+// resolves when it is given a recorder, so tools can answer "what is this" and
+// "where is it declared" without redoing name resolution.
+typedef enum {
+    REF_LOCAL, REF_PARAM, REF_FUNC, REF_CONST, REF_TYPE, REF_FIELD, REF_METHOD,
+    REF_VARIANT, REF_MODULE, REF_BUILTIN
+} ref_kind;
+
+typedef struct {
+    ref_kind    kind;
+    const char *module;       // the module the use is in
+    span        use;          // the identifier as written
+    bool        has_def;      // false for built-ins and anything without a declaration
+    const char *def_module;
+    span        def;          // the declared name
+    const char *name;
+    ty         *t;            // its type; the function type for a function
+    const char *detail;       // one-line declaration, e.g. "func area(r: float): float"
+} ref_info;
+
+typedef VEC(ref_info) ref_vec;
+
+// A local binding and the part of the source where it can be named.
+typedef struct {
+    const char *name;
+    ref_kind    kind;         // REF_LOCAL or REF_PARAM
+    ty         *t;
+    const char *module;
+    span        decl;
+    uint32_t    from, to;     // visible at offsets in [from, to)
+} scope_info;
+
+typedef VEC(scope_info) scope_vec;
+
+typedef struct {
+    ref_vec   refs;
+    scope_vec scopes;
+} check_record;
+
 // Check every module together. Diagnostics are appended to `diags`, each
 // tagged with the module that produced it.
 decls *check_modules(arena *a, sl_interner *in, loaded *l, diag_vec *diags);
+
+// Same, and fills `rec` (if not NULL) with what each name resolved to.
+decls *check_modules_recorded(arena *a, sl_interner *in, loaded *l, diag_vec *diags, check_record *rec);
+
+// One-line declaration of a function, e.g. "func area(r: float): float".
+const char *sig_describe(arena *a, const char *name, const fn_sig *sig);
 
 // Find a method by name in declaration order, or NULL.
 fn_sig *sig_lookup(const sig_vec *methods, const char *name);

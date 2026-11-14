@@ -39,6 +39,9 @@ typedef enum {
 typedef struct {
     bool        is_expr;
     const char *text;
+    // For an expression: where its text starts in the source, so the parser can
+    // give the tokens real positions. Unused for literal text.
+    uint32_t    offset;
 } str_part;
 
 typedef VEC(str_part) str_part_vec;
@@ -61,7 +64,14 @@ const char *token_describe(arena *a, const token *t);
 // The literal spelling of a fixed token, or "" for literals.
 const char *token_lexeme(token_kind k);
 
+typedef VEC(span) span_vec;
+
 // Tokenize `src`. The result always ends with T_EOF.
 token_vec lex(arena *a, sl_interner *in, const char *src, size_t len, diag_vec *diags);
+
+// Same, and when `comments` is not NULL every comment's span is appended to it,
+// in source order. Comments are not tokens, so the token stream is unchanged.
+token_vec lex_with_comments(arena *a, sl_interner *in, const char *src, size_t len,
+                            diag_vec *diags, span_vec *comments);
 
 #endif // SOLIS_LEX_H

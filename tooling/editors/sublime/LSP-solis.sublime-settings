@@ -1,0 +1,12 @@
+// Sublime Text 4, Linux and Windows, with the LSP package installed
+// (Package Control: Install Package > LSP).
+// Open Preferences > Package Settings > LSP > Settings and add this under "clients":
+//   "clients": { "solis": <the object below> }
+// Also copy Solis.sublime-syntax next to it (Preferences > Browse Packages > User).
+// `sl` must be on PATH (sl.exe on Windows).
+{
+    "enabled": true,
+    "command": ["sl", "lsp"],
+    "selector": "source.solis",
+    "initializationOptions": {}
+}

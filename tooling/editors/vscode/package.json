@@ -1,0 +1,43 @@
+{
+  "name": "solis",
+  "displayName": "Solis",
+  "description": "Solis language support: highlighting and the sl language server",
+  "version": "0.1.0",
+  "publisher": "solis",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "main": "./extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [{
+      "id": "solis",
+      "aliases": ["Solis", "solis"],
+      "extensions": [".sl"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "solis",
+      "scopeName": "source.solis",
+      "path": "./syntaxes/solis.tmLanguage.json"
+    }],
+    "configuration": {
+      "title": "Solis",
+      "properties": {
+        "solis.serverPath": {
+          "type": "string",
+          "default": "sl",
+          "description": "The sl executable. Looked up on PATH when not absolute (sl.exe on Windows)."
+        },
+        "solis.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Log the protocol traffic to the Solis output channel."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

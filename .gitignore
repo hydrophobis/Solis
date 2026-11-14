@@ -27,3 +27,4 @@ runtime/solis-run++
 # web: build.sh's emcc output
 web/solis_core.mjs
 web/solis_core.wasm
+/tooling/sl

@@ -16,7 +16,7 @@ import sys
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 PARTS = ["runtime/solis.h", "runtime/solis.c", "runtime/solis_std.c"]
 # Included from solis.c by name; pasted where the include stands.
-INLINE = {"opt.inc": "runtime/opt.inc", "opt_rules.inc": "runtime/opt_rules.inc"}
+INLINE = {"opt.inc": "runtime/opt.inc", "opt_rules.inc": "runtime/opt_rules.inc", "solis_text.inc": "runtime/solis_text.inc"}
 DEFAULT_OUT = "build/runtime.c"
 
 SYS_INCLUDE = re.compile(r'^\s*#\s*include\s*<([^>]+)>')

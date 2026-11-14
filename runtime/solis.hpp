@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <initializer_list>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -360,6 +361,36 @@ public:
 
     void run() {
         if (sl_run(vm_) != SL_OK) throw Error(lastError());
+    }
+
+    // Call one function of the loaded script by name, after run() has finished
+    // (run() initialises the globals and runs main; they keep their values
+    // between calls). Write `module.function`, or just `function` when only one
+    // module has that name. The arguments' types are not checked at run time.
+    // Throws Error on any failure. Returns what the function returns; a function
+    // that returns nothing gives a void Value.
+    Value call(const std::string &name, std::initializer_list<Value> args = {}) {
+        std::vector<sl_value> raw;
+        raw.reserve(args.size());
+        for (const Value &a : args) raw.push_back(a.raw());
+        sl_value out = sl_void();
+        if (sl_call(vm_, name.c_str(), static_cast<int>(raw.size()), raw.data(), &out) != SL_OK) {
+            std::string e = lastError();
+            throw Error(e.empty() || e == "unknown Solis error" ? "cannot call `" + name + "`" : e);
+        }
+        return Value::adopt(vm_, out);
+    }
+
+    bool hasFunction(const std::string &name) const noexcept {
+        return sl_find_function(vm_, name.c_str()) >= 0;
+    }
+
+    // Every function in the loaded image, as `module.function`. Imported
+    // modules' functions are included.
+    std::vector<std::string> functions() const {
+        std::vector<std::string> out;
+        for (int i = 0, n = sl_function_count(vm_); i < n; i++) out.emplace_back(sl_function_name(vm_, i));
+        return out;
     }
 
     Value string(std::string_view s) {

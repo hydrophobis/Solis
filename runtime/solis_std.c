@@ -247,6 +247,53 @@ static sl_value m_atan2(sl_vm *vm, int argc, sl_value *argv) {
     return sl_float(atan2(y, x));
 }
 
+#define UNARY_MATH(fname, expr, msg) \
+    static sl_value fname(sl_vm *vm, int argc, sl_value *argv) { \
+        double x = want_f(vm, argc, argv, 0, msg); \
+        return sl_float(expr); \
+    }
+UNARY_MATH(m_asin, asin(x), "asin expects a float")
+UNARY_MATH(m_acos, acos(x), "acos expects a float")
+UNARY_MATH(m_atan, atan(x), "atan expects a float")
+UNARY_MATH(m_sinh, sinh(x), "sinh expects a float")
+UNARY_MATH(m_cosh, cosh(x), "cosh expects a float")
+UNARY_MATH(m_tanh, tanh(x), "tanh expects a float")
+UNARY_MATH(m_log2, log2(x), "log2 expects a float")
+UNARY_MATH(m_cbrt, cbrt(x), "cbrt expects a float")
+UNARY_MATH(m_trunc, trunc(x), "trunc expects a float")
+
+static sl_value m_hypot(sl_vm *vm, int argc, sl_value *argv) {
+    double a = want_f(vm, argc, argv, 0, "hypot expects floats");
+    double b = want_f(vm, argc, argv, 1, "hypot expects floats");
+    return sl_float(hypot(a, b));
+}
+
+static sl_value m_fmod(sl_vm *vm, int argc, sl_value *argv) {
+    double a = want_f(vm, argc, argv, 0, "mod expects floats");
+    double b = want_f(vm, argc, argv, 1, "mod expects floats");
+    return sl_float(b == 0.0 ? 0.0 : fmod(a, b));
+}
+
+static sl_value m_is_nan(sl_vm *vm, int argc, sl_value *argv) {
+    double x = want_f(vm, argc, argv, 0, "isNaN expects a float");
+    return sl_bool(x != x);
+}
+
+static sl_value m_is_inf(sl_vm *vm, int argc, sl_value *argv) {
+    double x = want_f(vm, argc, argv, 0, "isInf expects a float");
+    return sl_bool(x == x && (x > 1.7976931348623157e308 || x < -1.7976931348623157e308));
+}
+
+static sl_value m_nan(sl_vm *vm, int argc, sl_value *argv) {
+    (void)vm; (void)argc; (void)argv;
+    return sl_float(NAN);
+}
+
+static sl_value m_inf(sl_vm *vm, int argc, sl_value *argv) {
+    (void)vm; (void)argc; (void)argv;
+    return sl_float(INFINITY);
+}
+
 static sl_value m_abs(sl_vm *vm, int argc, sl_value *argv) {
     return sl_float(fabs(want_f(vm, argc, argv, 0, "abs expects a float")));
 }
@@ -602,6 +649,88 @@ static sl_value s_is_int(sl_vm *vm, int argc, sl_value *argv) {
     return sl_bool(ok);
 }
 
+// The code point of the first character, or -1 for the empty string.
+static sl_value s_byte_len(sl_vm *vm, int argc, sl_value *argv) {
+    size_t n; const char *p = want_s(vm, argc, argv, 0, "byteLen expects a string", &n);
+    if (!p) return sl_void();
+    return sl_int((int64_t)n);
+}
+
+static sl_value s_code(sl_vm *vm, int argc, sl_value *argv) {
+    size_t n; const char *p = want_s(vm, argc, argv, 0, "code expects a string", &n);
+    if (!p) return sl_void();
+    if (n == 0) return sl_int(-1);
+    size_t w;
+    return sl_int((int64_t)utf8_next(p, n, 0, &w));
+}
+
+// The one-character string for a code point; empty if it is not a valid one.
+static sl_value s_from_code(sl_vm *vm, int argc, sl_value *argv) {
+    int64_t cp = want_i(vm, argc, argv, 0, "fromCode expects an int");
+    if (cp < 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return sl_cstr(vm, "");
+    char buf[4];
+    size_t w = utf8_put(buf, (uint32_t)cp);
+    return sl_str(vm, buf, w);
+}
+
+// Whole string, optional surrounding whitespace, finite result. Rejects what
+// strtod would also take (hex, "inf", "nan") so the two forms read alike.
+static double parse_float(const char *p, size_t n, bool *ok) {
+    size_t a = 0, b = n;
+    while (a < b && is_space(p[a])) a++;
+    while (b > a && is_space(p[b - 1])) b--;
+    *ok = false;
+    if (a >= b || b - a > 63) return 0.0;
+    char buf[64];
+    size_t digits = 0;
+    for (size_t i = a; i < b; i++) {
+        char c = p[i];
+        bool numeric = (c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-' || c == 'e' || c == 'E';
+        if (!numeric) return 0.0;
+        if (c >= '0' && c <= '9') digits++;
+        buf[i - a] = c;
+    }
+    if (digits == 0) return 0.0;
+    buf[b - a] = 0;
+    char *end;
+    double v = strtod(buf, &end);
+    if (*end != 0 || v != v || v > 1.7976931348623157e308 || v < -1.7976931348623157e308) return 0.0;
+    *ok = true;
+    return v;
+}
+
+static sl_value s_to_float(sl_vm *vm, int argc, sl_value *argv) {
+    size_t n; const char *p = want_s(vm, argc, argv, 0, "toFloat expects a string", &n);
+    if (!p) return sl_void();
+    bool ok;
+    double v = parse_float(p, n, &ok);
+    return sl_float(ok ? v : 0.0);
+}
+
+static sl_value s_is_float(sl_vm *vm, int argc, sl_value *argv) {
+    size_t n; const char *p = want_s(vm, argc, argv, 0, "isFloat expects a string", &n);
+    if (!p) return sl_void();
+    bool ok;
+    parse_float(p, n, &ok);
+    return sl_bool(ok);
+}
+
+// `x` with exactly `digits` places after the point (0 to 30), rounded to
+// nearest; the same text C's printf("%.*f") gives.
+static sl_value s_fixed(sl_vm *vm, int argc, sl_value *argv) {
+    double x = want_f(vm, argc, argv, 0, "fixed expects a float and an int");
+    int64_t d = want_i(vm, argc, argv, 1, "fixed expects a float and an int");
+    if (d < 0) d = 0;
+    if (d > 30) d = 30;
+    char buf[400];
+    int n = snprintf(buf, sizeof buf, "%.*f", (int)d, x);
+    if (n < 0) return sl_cstr(vm, "");
+    if ((size_t)n >= sizeof buf) n = (int)sizeof buf - 1;
+    return sl_str(vm, buf, (size_t)n);
+}
+
+#include "solis_text.inc"
+
 void sl_open_std(sl_vm *vm) {
     struct { const char *name; sl_native_fn fn; } table[] = {
         { "math.toFloat",  m_to_float },
@@ -618,6 +747,21 @@ void sl_open_std(sl_vm *vm) {
         { "math.cos",       m_cos },
         { "math.tan",       m_tan },
         { "math.atan2",     m_atan2 },
+        { "math.asin",      m_asin },
+        { "math.acos",      m_acos },
+        { "math.atan",      m_atan },
+        { "math.sinh",      m_sinh },
+        { "math.cosh",      m_cosh },
+        { "math.tanh",      m_tanh },
+        { "math.log2",      m_log2 },
+        { "math.cbrt",      m_cbrt },
+        { "math.trunc",     m_trunc },
+        { "math.hypot",     m_hypot },
+        { "math.mod",       m_fmod },
+        { "math.isNaN",     m_is_nan },
+        { "math.isInf",     m_is_inf },
+        { "math.nan",       m_nan },
+        { "math.inf",       m_inf },
         { "math.abs",       m_abs },
         { "math.absInt",   m_abs_int },
 
@@ -642,6 +786,13 @@ void sl_open_std(sl_vm *vm) {
         { "strings.fromBool",   s_from_bool },
         { "strings.toInt",      s_to_int },
         { "strings.isInt",      s_is_int },
+        { "strings.toFloat",    s_to_float },
+        { "strings.isFloat",    s_is_float },
+        { "strings.code",       s_code },
+        { "strings.fromCode",   s_from_code },
+        { "strings.fixed",      s_fixed },
+        { "strings.byteLen",    s_byte_len },
+        TEXT_NATIVES
     };
     for (size_t i = 0; i < sizeof table / sizeof table[0]; i++)
         sl_register(vm, table[i].name, table[i].fn);

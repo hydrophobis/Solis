@@ -106,6 +106,7 @@ typedef struct {
     arena       *a;
     sl_interner *in;
     diag_vec    *diags;
+    span_vec    *comments;      // NULL unless the caller wants them
 } lexer;
 
 // Bytes in the UTF-8 sequence starting with `b`. A continuation or invalid
@@ -151,7 +152,9 @@ static void skip_trivia(lexer *L) {
         while (!at_end(L) && is_ws(peek(L))) L->pos++;
 
         if (peek(L) == '/' && peek_at(L, 1) == '/') {
+            size_t start = L->pos;
             while (!at_end(L) && peek(L) != '\n') L->pos++;
+            if (L->comments) vec_push(L->a, L->comments, span_make(start, L->pos));
             continue;
         }
         if (peek(L) == '/' && peek_at(L, 1) == '*') {
@@ -169,6 +172,7 @@ static void skip_trivia(lexer *L) {
                 diag_help(L->a, L->diags, span_make(start, L->len),
                           "add `*/` to close it", "unterminated block comment");
             }
+            if (L->comments) vec_push(L->a, L->comments, span_make(start, L->pos));
             continue;
         }
         break;
@@ -344,6 +348,7 @@ static bool scan_string(lexer *L, token *out) {
             if (text.len) {
                 str_part p;
                 p.is_expr = false;
+                p.offset = 0;
                 p.text = arena_strndup(L->a, text.at, (size_t)text.len);
                 vec_push(L->a, &parts, p);
                 memset(&text, 0, sizeof text);
@@ -384,6 +389,7 @@ static bool scan_string(lexer *L, token *out) {
             } else {
                 str_part p;
                 p.is_expr = true;
+                p.offset = (uint32_t)s0;
                 p.text = arena_strndup(L->a, L->src + s0, s1 - s0);
                 vec_push(L->a, &parts, p);
             }
@@ -401,6 +407,7 @@ static bool scan_string(lexer *L, token *out) {
     if (text.len || parts.len == 0) {
         str_part p;
         p.is_expr = false;
+        p.offset = 0;
         p.text = arena_strndup(L->a, text.at ? text.at : "", (size_t)text.len);
         vec_push(L->a, &parts, p);
     }
@@ -489,7 +496,8 @@ static bool scan_token(lexer *L, token *out) {
     }
 }
 
-token_vec lex(arena *a, sl_interner *in, const char *src, size_t len, diag_vec *diags) {
+token_vec lex_with_comments(arena *a, sl_interner *in, const char *src, size_t len,
+                            diag_vec *diags, span_vec *comments) {
     lexer L;
     L.src = src;
     L.len = len;
@@ -497,6 +505,7 @@ token_vec lex(arena *a, sl_interner *in, const char *src, size_t len, diag_vec *
     L.a = a;
     L.in = in;
     L.diags = diags;
+    L.comments = comments;
 
     token_vec out;
     memset(&out, 0, sizeof out);
@@ -521,4 +530,8 @@ token_vec lex(arena *a, sl_interner *in, const char *src, size_t len, diag_vec *
         // A failed scan already recorded a diagnostic; keep going.
     }
     return out;
+}
+
+token_vec lex(arena *a, sl_interner *in, const char *src, size_t len, diag_vec *diags) {
+    return lex_with_comments(a, in, src, len, diags, NULL);
 }

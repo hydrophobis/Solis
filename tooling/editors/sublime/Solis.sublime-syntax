@@ -1,0 +1,55 @@
+%YAML 1.2
+---
+name: Solis
+file_extensions: [sl]
+scope: source.solis
+contexts:
+  main:
+    - match: '//.*$'
+      scope: comment.line.double-slash.solis
+    - match: '/\*'
+      scope: punctuation.definition.comment.solis
+      push: block-comment
+    - match: '"'
+      scope: punctuation.definition.string.begin.solis
+      push: string
+    - match: '\b(func)\s+([A-Za-z_]\w*)'
+      captures:
+        1: keyword.declaration.function.solis
+        2: entity.name.function.solis
+    - match: '\b(struct|enum|interface)\s+([A-Za-z_]\w*)'
+      captures:
+        1: keyword.declaration.type.solis
+        2: entity.name.type.solis
+    - match: '\b(if|else|while|for|in|switch|case|default|return|break|continue)\b'
+      scope: keyword.control.solis
+    - match: '\b(let|var|static|extern|arena|weak|mut|import)\b'
+      scope: storage.type.solis
+    - match: '\b(true|false|null)\b'
+      scope: constant.language.solis
+    - match: '\bthis\b'
+      scope: variable.language.solis
+    - match: '\b(int|float|bool|str|void)\b'
+      scope: storage.type.solis
+    - match: '\b[0-9][0-9_]*(\.[0-9][0-9_]*)?\b'
+      scope: constant.numeric.solis
+  block-comment:
+    - meta_scope: comment.block.solis
+    - match: '/\*'
+      push: block-comment
+    - match: '\*/'
+      pop: true
+  string:
+    - meta_scope: string.quoted.double.solis
+    - match: '\\.'
+      scope: constant.character.escape.solis
+    - match: '\$\{'
+      push: interpolation
+    - match: '"'
+      scope: punctuation.definition.string.end.solis
+      pop: true
+  interpolation:
+    - meta_scope: meta.interpolation.solis
+    - match: '\}'
+      pop: true
+    - include: main

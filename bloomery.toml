@@ -31,6 +31,14 @@ headers = "{compiler_headers} {runtime_headers} {std_sources}"
 output = "-o solis{exe} -lm"
 outputs = ["solis{exe}"]
 
+[tasks.sl]
+command = "{cc}"
+flags = "{cflags} -Icompiler -Iruntime"
+files = "{compiler_sources} {runtime_sources} tooling/sl.c tooling/lsp.c tooling/json.c"
+headers = "{compiler_headers} {runtime_headers} {std_sources}"
+output = "-o tooling/sl{exe} -lm"
+outputs = ["tooling/sl{exe}"]
+
 [tasks.lib]
 default = false
 command = "{cc}"
@@ -92,6 +100,29 @@ command = "bash tools/conform.sh"
 default = false
 always_run = true
 command = "python tools/optrules.py --check"
+
+[tasks.apitest]
+default = false
+always_run = true
+command = "bash tools/apitest.sh"
+
+[tasks.regexfuzz]
+depends = ["solis"]
+default = false
+always_run = true
+command = "python tools/fuzz-regex.py 1000 1"
+
+[tasks.tomlcheck]
+depends = ["solis"]
+default = false
+always_run = true
+command = "python tools/toml-check.py"
+
+[tasks.lsptest]
+depends = ["sl"]
+default = false
+always_run = true
+command = "python tools/lsptest.py"
 
 [tasks.batteries]
 depends = ["solis"]

@@ -11,7 +11,7 @@
 
 #define SL_STACK_MAX   4096
 #define SL_FRAMES_MAX  256
-#define SL_NATIVES_MAX 128
+#define SL_NATIVES_MAX 256
 #define SL_POOL_FIELDS 8   // structs up to this many fields are recycled, not freed
 
 enum {
@@ -150,6 +150,10 @@ struct sl_vm {
     sl_value *sp;
     sl_frame  frames[SL_FRAMES_MAX];
     int nframes;
+
+    sl_value  ret;      // what the function that just returned gave back; owned by the VM until sl_call hands it over
+    bool      running;  // inside sl_run or sl_call; they cannot be nested
+    bool      ready;    // sl_run has finished, so the globals are initialised and functions can be called by name
 
     int64_t live;       // heap objects alive, for leak checks
     sl_value *kstr;     // shared string objects for the image's string constants, made on first use
@@ -2299,6 +2303,8 @@ sl_result sl_load(sl_vm *vm, const uint8_t *bytes, size_t len) {
         for (uint8_t k = 0; k < n && k < 32; k++) vm->struct_desc[i][1 + k] = rd_u8(&r);
     }
 
+    vm->ready = false;
+
     // Globals start void; the image's entry function initialises them.
     vm->nglobals = rd_u16(&r);
     vm->globals = (sl_value *)calloc(vm->nglobals ? vm->nglobals : 1, sizeof(sl_value));
@@ -2612,16 +2618,19 @@ static SL_NOINLINE bool opf_LDS(sl_vm *vm, sl_value *R, uint16_t *ip) {
 #if defined(SL_THREADED) && defined(__GNUC__) && !defined(__clang__)
 __attribute__((optimize("no-gcse", "no-crossjumping", "no-tree-slp-vectorize", "no-if-conversion", "no-if-conversion2")))
 #endif
-sl_result sl_run(sl_vm *vm) {
+static sl_result run_function(sl_vm *vm, uint16_t id, int argc, const sl_value *argv) {
     if (vm->nfuncs == 0) { vm_error(vm, "nothing loaded"); return SL_ERR_RUNTIME; }
 
     sl_value *const stack_end = vm->stack + SL_STACK_MAX;
-    sl_func *fn = &vm->funcs[vm->entry];
+    sl_func *fn = &vm->funcs[id];
     sl_value *R = vm->stack;
     if (R + fn->nregs > stack_end) { vm_error(vm, "stack overflow"); return SL_ERR_RUNTIME; }
     vm->nframes = 0;
     vm->failed = false;
     vm->err[0] = 0;
+    vm->ret = sl_void();
+    // Parameters are the first registers of a frame. The callee owns and drops them, so give it its own reference.
+    for (int i = 0; i < argc; i++) { sl_retain(argv[i]); vstore(&R[i], argv[i]); }
     sl_frame *const frames_first = vm->frames;
     sl_frame *const frames_last = vm->frames + SL_FRAMES_MAX - 1;
     sl_frame *fr = frames_first;
@@ -3027,7 +3036,7 @@ sl_result sl_run(sl_vm *vm) {
             sl_value result = vload(&RR(0));
             moved(&RR(0));
             for (sl_value *p = R, *end = R + fn->nregs; p < end; p++) drop(vm, p);
-            if (fr == frames_first) { rel(vm, result); return SL_OK; }
+            if (fr == frames_first) { vm->ret = result; return SL_OK; }
             vstore(&R[0], result);
             fr--;
             fn = fr->fn; R = fr->base; ip = fr->ip;
@@ -3197,6 +3206,74 @@ fail:
     release_stack(vm, R + fn->nregs);
     vm->nframes = 0;
     return SL_ERR_RUNTIME;
+}
+
+sl_result sl_run(sl_vm *vm) {
+    if (vm->running) return SL_ERR_CALL;       // from inside a native: refused without disturbing the run in progress
+    vm->running = true;
+    sl_result r = run_function(vm, vm->entry, 0, NULL);
+    vm->running = false;
+    rel(vm, vm->ret);
+    vm->ret = sl_void();
+    if (r == SL_OK) vm->ready = true;
+    return r;
+}
+
+int sl_function_count(const sl_vm *vm) { return vm->nfuncs; }
+
+const char *sl_function_name(const sl_vm *vm, int index) {
+    return index >= 0 && index < vm->nfuncs ? vm->funcs[index].name : NULL;
+}
+
+int sl_function_arity(const sl_vm *vm, int index) {
+    return index >= 0 && index < vm->nfuncs ? vm->funcs[index].arity : -1;
+}
+
+int sl_find_function(const sl_vm *vm, const char *name) {
+    if (!name || !*name) return -1;
+    for (int i = 0; i < vm->nfuncs; i++)
+        if (strcmp(vm->funcs[i].name, name) == 0) return i;
+    if (strchr(name, '.')) return -1;
+    // A bare name: the one function that is called that in some module.
+    size_t n = strlen(name);
+    int found = -1;
+    for (int i = 0; i < vm->nfuncs; i++) {
+        const char *f = vm->funcs[i].name;
+        size_t fl = strlen(f);
+        if (fl > n + 1 && f[fl - n - 1] == '.' && memcmp(f + fl - n, name, n) == 0) {
+            if (found >= 0) return -2;
+            found = i;
+        }
+    }
+    return found;
+}
+
+sl_result sl_call_index(sl_vm *vm, int index, int argc, const sl_value *argv, sl_value *result) {
+    if (result) *result = sl_void();
+    if (vm->running) return SL_ERR_CALL;       // from inside a native: refused without disturbing the run in progress
+    if (vm->nfuncs == 0) { vm_error(vm, "nothing loaded"); return SL_ERR_CALL; }
+    if (index < 0 || index >= vm->nfuncs || index == vm->entry) { vm_error(vm, "no such function"); return SL_ERR_CALL; }
+    if (!vm->ready) { vm_error(vm, "call sl_run first: it initialises the script's globals"); return SL_ERR_CALL; }
+    const sl_func *fn = &vm->funcs[index];
+    if (argc < 0 || argc != fn->arity || (argc > 0 && !argv)) {
+        vm_error(vm, "`%s` takes %d argument(s) but %d were given", fn->name, fn->arity, argc);
+        return SL_ERR_CALL;
+    }
+    vm->running = true;
+    sl_result r = run_function(vm, (uint16_t)index, argc, argv);
+    vm->running = false;
+    if (r == SL_OK && result) { *result = vm->ret; vm->ret = sl_void(); }
+    else { rel(vm, vm->ret); vm->ret = sl_void(); }
+    return r;
+}
+
+sl_result sl_call(sl_vm *vm, const char *name, int argc, const sl_value *argv, sl_value *result) {
+    if (result) *result = sl_void();
+    if (vm->running) return SL_ERR_CALL;
+    int index = sl_find_function(vm, name);
+    if (index == -1) { vm_error(vm, "no function named `%s`", name ? name : "(null)"); return SL_ERR_CALL; }
+    if (index == -2) { vm_error(vm, "`%s` is ambiguous; write it as module.%s", name, name); return SL_ERR_CALL; }
+    return sl_call_index(vm, index, argc, argv, result);
 }
 
 #ifdef SL_AOT_EMITTER

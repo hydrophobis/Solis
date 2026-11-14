@@ -1,0 +1,17 @@
+# Helix, Linux and Windows. Append this to
+#   ~/.config/helix/languages.toml        (Windows: %AppData%\helix\languages.toml)
+# `sl` must be on PATH (sl.exe on Windows). Check with `hx --health solis`.
+
+[language-server.sl]
+command = "sl"
+args = ["lsp"]
+
+[[language]]
+name = "solis"
+scope = "source.solis"
+file-types = ["sl"]
+roots = ["solis.toml"]
+comment-token = "//"
+block-comment-tokens = { start = "/*", end = "*/" }
+indent = { tab-width = 4, unit = "    " }
+language-servers = ["sl"]

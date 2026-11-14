@@ -27,6 +27,15 @@ extern func cwd(): str;
 // process's output goes.
 extern func run(command: str): int;
 
+// Runs a command through the system shell and returns what it wrote to its
+// standard output; its error output still goes to this process's. Empty if it
+// could not be started. Read the exit status with `lastStatus`.
+extern func output(command: str): str;
+
+// The exit status of the most recent `output` call, or -1 if it could not
+// be started.
+extern func lastStatus(): int;
+
 // The script's own arguments, without the script path. Index 0 is the first
 // real argument, which is what a script usually wants.
 func argv(): [str] {
@@ -53,4 +62,20 @@ func envOr(name: str, fallback: str): str {
         return fallback;
     }
     return env(name);
+}
+
+// The user's home directory, or "" if the environment does not say.
+func home(): str {
+    if isWindows() {
+        return envOr("USERPROFILE", "");
+    }
+    return envOr("HOME", "");
+}
+
+// A directory for temporary files.
+func tempDir(): str {
+    if isWindows() {
+        return envOr("TEMP", ".");
+    }
+    return envOr("TMPDIR", "/tmp");
 }

@@ -35,7 +35,7 @@ static char *read_file(arena *a, const char *path, size_t *len_out) {
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (n < 0) { fclose(f); return NULL; }
+    if (n < 0 || n > (1L << 30)) { fclose(f); return NULL; }   // a directory reports a huge size
     char *buf = (char *)arena_alloc(a, (size_t)n + 1);
     size_t got = fread(buf, 1, (size_t)n, f);
     fclose(f);
@@ -51,9 +51,27 @@ typedef struct {
     diag_vec    *diags;
     const char  *dir;
     const char  *host_src;
+    const char  *entry_path;        // the entry, whose text may be given directly
+    const char  *entry_src;
+    const module_io *io;            // NULL reads from disk
     // The import stack, so a cycle can be named as a chain.
     VEC(const char *) stack;
 } loader;
+
+static bool io_exists(loader *L, const char *path) {
+    if (L->entry_src && strcmp(path, L->entry_path) == 0) return true;
+    if (L->io && L->io->exists) return L->io->exists(L->io->user, path);
+    return file_exists(path);
+}
+
+static const char *io_read(loader *L, const char *path, size_t *len) {
+    if (L->entry_src && strcmp(path, L->entry_path) == 0) {
+        *len = strlen(L->entry_src);
+        return L->entry_src;
+    }
+    if (L->io && L->io->read) return L->io->read(L->io->user, L->a, path, len);
+    return read_file(L->a, path, len);
+}
 
 static void tagged(loader *L, const char *module_name, span at,
                    const char *help, const char *msg) {
@@ -83,11 +101,11 @@ static void load_one(loader *L, const char *name, const char *path) {
         src = L->host_src;
         src_len = strlen(src);
         path = "<host>";
-    } else if (embedded && !file_exists(path)) {
+    } else if (embedded && !io_exists(L, path)) {
         src = embedded;
         src_len = strlen(embedded);
     } else {
-        char *buf = read_file(L->a, path, &src_len);
+        const char *buf = io_read(L, path, &src_len);
         if (!buf) {
             // Blamed on the importer, which is where the reader can act on it.
             const char *blame = L->stack.len ? L->stack.at[L->stack.len - 1] : name;
@@ -158,7 +176,9 @@ static void load_one(loader *L, const char *name, const char *path) {
     vec_push(L->a, &L->stack, name);
     for (int i = 0; i < m->imports.len; i++) {
         const char *imp = m->imports.at[i];
-        load_one(L, imp, child_path(L, imp));
+        const char *ipath = NULL;
+        if (L->io && L->io->resolve) ipath = L->io->resolve(L->io->user, L->a, m->path, imp);
+        load_one(L, imp, ipath ? ipath : child_path(L, imp));
     }
     L->stack.len--;
 }
@@ -192,6 +212,12 @@ static void split_path(arena *a, const char *path, const char **dir, const char 
 
 loaded *module_load(arena *a, sl_interner *in, const char *entry_path,
                     const char *prelude_path, const char *host_src, diag_vec *diags) {
+    return module_load_io(a, in, entry_path, NULL, prelude_path, host_src, NULL, diags);
+}
+
+loaded *module_load_io(arena *a, sl_interner *in, const char *entry_path,
+                       const char *entry_src, const char *prelude_path,
+                       const char *host_src, const module_io *io, diag_vec *diags) {
     loaded *out = NEW(a, loaded);
 
     const char *dir;
@@ -207,6 +233,9 @@ loaded *module_load(arena *a, sl_interner *in, const char *entry_path,
     L.diags = diags;
     L.dir = dir;
     L.host_src = host_src;
+    L.entry_path = entry_path;
+    L.entry_src = entry_src;
+    L.io = io;
 
     load_one(&L, out->root, entry_path);
 
@@ -217,7 +246,7 @@ loaded *module_load(arena *a, sl_interner *in, const char *entry_path,
     const char *path = prelude_path;
     if (!path) {
         path = child_path(&L, "prelude");
-        if (!file_exists(path)) path = "";
+        if (!io_exists(&L, path)) path = "";
     }
     if (*path) {
         const char *pdir;

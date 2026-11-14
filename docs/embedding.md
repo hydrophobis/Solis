@@ -265,7 +265,7 @@ vm.define("frame", [&frame](solis::Vm &, solis::Args) { return solis::Value::int
 
 `Value` handles reference counting for you (copy retains, destruction releases). `Value::integer/number/boolean`, `vm.string()`, `vm.array()` build values; `isInt()`, `asInt()`, `asString()`, `toString()`, `size()`, `at(i)` read them.
 
-A `Vm` accepts at most 128 natives, and `vm.nativesRemaining()` tells you how many are left. The runtime uses some itself: a fresh VM had 115 free after `sl_new`, and `openStd()` took 37 of them.
+A `Vm` accepts at most 256 natives, and `vm.nativesRemaining()` tells you how many are left. The runtime uses some itself: a fresh VM had 243 free after `sl_new`, and `openStd()` took 84 of them.
 
 ## 5. What a script can reach
 
@@ -280,6 +280,36 @@ A missing native fails at load, not at the call. Every native the program calls 
 
 To run untrusted scripts, leave out `sl_open_os`, register only natives you are comfortable exposing, and consider the amalgamated runtime, which does not contain `solis_os.c` at all.
 
+## 5b. Calling a script's functions
+
+`sl_run` runs the script's `main`. A host often wants more than that: a script that registers keybindings in `main` and then has a function called when the key is pressed, or a plugin with `onFrame()` and `onClick(x, y)` entry points. Call those by name after `sl_run` has finished:
+
+```c
+sl_run(vm);                                   // initialises the globals, runs main
+
+sl_value arg = sl_int(5), result;
+if (sl_call(vm, "game.bump", 1, &arg, &result) == SL_OK) {
+    printf("%lld\n", (long long)result.as.i);
+    sl_release(vm, result);                    // a no-op for ints; required for strings, arrays, structs
+}
+```
+
+```cpp
+vm.run();
+auto n = vm.call("bump", {solis::Value::integer(5)}).asInt();
+```
+
+- **Globals keep their values between calls**, so one VM per script gives the script real state. One `sl_run`, then as many calls as you like.
+- **Names** are `module.function`, as in the image: a script `game.sl` is module `game`. A bare name such as `bump` also works when exactly one module has a function called that. `sl_find_function` returns the index, `-1` when there is none and `-2` when the bare name is ambiguous; ask for `module.function` then.
+- **Arguments are borrowed.** `sl_call` takes its own reference for the callee. Their types are **not checked at run time**, so pass what the function declares (the count is checked). Build strings with `sl_cstr(vm, ...)` and release them yourself afterwards.
+- **The result is yours**: release it with `sl_release`. Pass `NULL` for `result` if you do not want it. A function that returns nothing gives `sl_void()`.
+- **List the functions** with `sl_function_count`, `sl_function_name` and `sl_function_arity` (C++: `vm.functions()`, `vm.hasFunction(name)`). The list includes imported modules' functions and the compiler's synthetic `<start>` entry, which cannot be called. A host that wants only the script's own, with no arguments, can filter by the `module.` prefix and arity 0.
+- **Failures** return `SL_ERR_CALL` (no such function, wrong argument count, `sl_run` not finished) or `SL_ERR_RUNTIME` (the function faulted, as in `sl_run`), with the message in `sl_error(vm)`. A fault leaves the VM usable: call another function afterwards. C++ throws `solis::Error`.
+- **Not from inside a native.** `sl_run` and `sl_call` return `SL_ERR_CALL` if called while the VM is running; the run in progress is left alone.
+- **One thread at a time.** A VM is still not thread-safe. Calls on one VM must not overlap.
+
+This replaces the usual workaround of compiling a small wrapper script per function (`import module; func main() { module.fn(); }`), which needed a file on disk, a valid module name and one compile per function.
+
 ## 6. Errors, in the order they happen
 
 | Stage | Where | You see |
@@ -287,6 +317,7 @@ To run untrusted scripts, leave out `sl_open_os`, register only natives you are 
 | Compile | `sl_compile_file` returns non-zero | `c.errors`: rendered diagnostics with file, line, a source excerpt and a caret, plus `c.error_count`. C++ throws `solis::CompileError`. |
 | Load | `sl_load` returns `SL_ERR_BADFILE` or `SL_ERR_LINK` | `sl_error(vm)`: `not a Solis bytecode image`, a version mismatch, or the link problems listed under Signatures. |
 | Run | `sl_run` returns `SL_ERR_RUNTIME` | `sl_error(vm)`: for example `index 10 is out of bounds for an array of length 3`, or the message from your `sl_fail`. |
+| Call | `sl_call` returns `SL_ERR_CALL` or `SL_ERR_RUNTIME` | `sl_error(vm)`: `no function named ...`, ``... takes 1 argument(s) but 0 were given``, `call sl_run first`, or the fault's message. |
 
 Compile errors include a missing file (`cannot read module`) and import problems. A type error looks like:
 

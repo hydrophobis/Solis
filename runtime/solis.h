@@ -68,7 +68,8 @@ typedef enum {
     SL_ERR_BADFILE,     // not Solis bytecode, or an unknown version
     SL_ERR_RUNTIME,     // the script faulted
     SL_ERR_NOMEM,
-    SL_ERR_LINK         // unregistered native or signature mismatch
+    SL_ERR_LINK,        // unregistered native or signature mismatch
+    SL_ERR_CALL         // sl_call could not start: no such function, wrong argument count, or sl_run has not finished
 } sl_result;
 
 sl_vm      *sl_new(void);
@@ -85,6 +86,30 @@ bool        sl_register(sl_vm *vm, const char *name, sl_native_fn fn);
 char       *sl_declarations(const sl_vm *vm);
 sl_result   sl_load(sl_vm *vm, const uint8_t *bytes, size_t len);
 sl_result   sl_run(sl_vm *vm);
+
+// Calling one function of a loaded script by name, after sl_run has finished
+// (sl_run initialises the script's globals and runs main, which is where a host
+// usually lets a script register itself). The globals keep their values between
+// calls, so a script can hold state.
+//
+// Names are written `module.function`, as in the image. A bare name works when
+// exactly one module has a function of that name; sl_find_function returns -2
+// for an ambiguous one. The image's synthetic entry function cannot be called.
+//
+// Arguments are borrowed. Their types are not checked at run time, so pass what
+// the function declares. On success *result (if given) is the function's return
+// value, owned by the caller: sl_release it. A function that returns nothing gives
+// sl_void(). Errors read like sl_run's: sl_error(vm). Neither sl_run nor sl_call
+// may be called from inside a native; they return SL_ERR_CALL and leave the run in progress alone.
+sl_result   sl_call(sl_vm *vm, const char *name, int argc, const sl_value *argv, sl_value *result);
+sl_result   sl_call_index(sl_vm *vm, int index, int argc, const sl_value *argv, sl_value *result);
+
+// The functions in the loaded image, imported modules' included. Names are
+// `module.function`; the first entry is not necessarily a user function.
+int         sl_function_count(const sl_vm *vm);
+const char *sl_function_name(const sl_vm *vm, int index);   // NULL out of range; owned by the VM
+int         sl_function_arity(const sl_vm *vm, int index);  // -1 out of range
+int         sl_find_function(const sl_vm *vm, const char *name);  // index, -1 if none, -2 if ambiguous
 
 const char *sl_error(const sl_vm *vm);
 void        sl_fail(sl_vm *vm, const char *msg);

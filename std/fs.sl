@@ -64,3 +64,69 @@ func writeNew(path: str, text: str): bool {
     }
     return write(path, text);
 }
+
+// Creates `path` and any missing parents. False if it could not be made;
+// true if it exists as a directory afterwards, including when it already did.
+func mkdirs(path: str): bool {
+    if isDir(path) {
+        return true;
+    }
+    var built = "";
+    if strings.startsWith(path, "/") {
+        built = "/";
+    }
+    for part in strings.split(strings.replace(path, "\\", "/"), "/") {
+        if strings.isEmpty(part) {
+            continue;
+        }
+        if strings.isEmpty(built) || built == "/" {
+            built = built + part;
+        } else {
+            built = built + "/" + part;
+        }
+        if !isDir(built) && !mkdir(built) {
+            return false;
+        }
+    }
+    return isDir(path);
+}
+
+// Every file and directory below `dir`, as paths starting with `dir`,
+// directories before their contents. Empty if `dir` is not a directory.
+func walk(dir: str): [str] {
+    var out: [str] = [];
+    for name in list(dir) {
+        let full = dir + "/" + name;
+        push(out, full);
+        if isDir(full) {
+            for inner in walk(full) {
+                push(out, inner);
+            }
+        }
+    }
+    return out;
+}
+
+// Copies a file's contents to `to`, replacing it. False if either end failed.
+func copy(from: str, to: str): bool {
+    if !exists(from) {
+        return false;
+    }
+    return write(to, read(from));
+}
+
+// Deletes a file, or a directory and everything in it. False if anything
+// could not be removed.
+func removeAll(path: str): bool {
+    if !exists(path) {
+        return true;
+    }
+    if isDir(path) {
+        for name in list(path) {
+            if !removeAll(path + "/" + name) {
+                return false;
+            }
+        }
+    }
+    return remove(path);
+}

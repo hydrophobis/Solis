@@ -2,12 +2,18 @@
 
 #include "parse.h"
 
+#include <ctype.h>
 #include <stdio.h>
 
 typedef struct {
     const char *name;
     ty         *t;
     bool        assignable;
+    // For tools: where the binding was declared, and its entry in the scope list.
+    bool        has_decl;
+    ref_kind    kind;
+    span        decl;
+    int         scope_idx;      // index into rec->scopes, or -1
 } binding_entry;
 
 typedef struct {
@@ -48,6 +54,15 @@ typedef struct {
     map cycles_checked;
     VEC(named_ty) active_subst;   // generic param name -> its concrete ty here
     program *current_prog;        // the module being collect_details'd
+
+    // Recording for tools; all of it is unused when rec is NULL.
+    check_record *rec;
+    loaded       *l;
+    VEC(uint32_t) scope_ends;     // where each open scope ends, parallel to scope_marks
+    span          member_use;     // the member name's span, when the caller knows it
+    bool          member_use_set;
+    span          head_use;       // the first name of a dotted path, when the caller knows it
+    bool          head_use_set;
 } checker;
 
 fn_sig *sig_lookup(const sig_vec *methods, const char *name) {
@@ -114,21 +129,58 @@ static bool is_visible_module(checker *C, const char *name) {
     return false;
 }
 
-static void push_scope(checker *C) {
+// `end` is where the scope stops being visible, for tools that ask what names
+// are in scope at a position.
+static void push_scope_to(checker *C, uint32_t end) {
     vec_push(C->a, &C->scope_marks, C->scope.len);
+    vec_push(C->a, &C->scope_ends, end);
 }
+
+static void push_scope(checker *C) { push_scope_to(C, UINT32_MAX); }
 
 static void pop_scope(checker *C) {
     if (C->scope_marks.len == 0) return;
-    C->scope.len = C->scope_marks.at[--C->scope_marks.len];
+    int mark = C->scope_marks.at[--C->scope_marks.len];
+    uint32_t end = C->scope_ends.at[--C->scope_ends.len];
+    if (C->rec)
+        for (int i = mark; i < C->scope.len; i++)
+            if (C->scope.at[i].scope_idx >= 0) C->rec->scopes.at[C->scope.at[i].scope_idx].to = end;
+    C->scope.len = mark;
 }
+
+static void rec_declaration(checker *C, ref_kind kind, const char *name, ty *t, span decl);
 
 static void declare(checker *C, const char *name, ty *t, bool assignable) {
     binding_entry b;
+    memset(&b, 0, sizeof b);
     b.name = name;
     b.t = t;
     b.assignable = assignable;
+    b.scope_idx = -1;
     vec_push(C->a, &C->scope, b);
+}
+
+// A binding with a known declaration, visible from `visible_from` to the end of
+// the enclosing scope. `decl` is where its name is written.
+static void declare_at(checker *C, const char *name, ty *t, bool assignable, ref_kind kind,
+                       span decl, uint32_t visible_from) {
+    declare(C, name, t, assignable);
+    binding_entry *b = &C->scope.at[C->scope.len - 1];
+    b->has_decl = true;
+    b->kind = kind;
+    b->decl = decl;
+    if (!C->rec) return;
+    scope_info si;
+    si.name = name;
+    si.kind = kind;
+    si.t = t;
+    si.module = C->current_module;
+    si.decl = decl;
+    si.from = visible_from;
+    si.to = UINT32_MAX;
+    b->scope_idx = C->rec->scopes.len;
+    vec_push(C->a, &C->rec->scopes, si);
+    rec_declaration(C, kind, name, t, decl);
 }
 
 static binding_entry *lookup(checker *C, const char *name) {
@@ -141,6 +193,188 @@ static type_param *find_type_param(checker *C, const char *name) {
     for (int i = C->type_params.len - 1; i >= 0; i--)
         if (strcmp(C->type_params.at[i].name, name) == 0) return &C->type_params.at[i];
     return NULL;
+}
+
+// ---- recording, for tools ------------------------------------------------------
+//
+// Everything below does nothing unless the checker was given a recorder.
+
+static ty *sig_as_func_ty(checker *C, const fn_sig *sig);
+
+const char *sig_describe(arena *a, const char *name, const fn_sig *sig) {
+    const char *ps = "";
+    for (int i = 0; i < sig->params.len; i++) {
+        const char *one = arena_printf(a, "%s: %s", sig->params.at[i].name,
+                                       ty_show(a, sig->params.at[i].t));
+        ps = i == 0 ? one : arena_printf(a, "%s, %s", ps, one);
+    }
+    const char *gs = "";
+    for (int i = 0; i < sig->generics.len; i++)
+        gs = i == 0 ? sig->generics.at[i].name : arena_printf(a, "%s, %s", gs, sig->generics.at[i].name);
+    const char *head = sig->is_static ? "static func" : sig->is_mut ? "mut func" : "func";
+    const char *generic = sig->generics.len ? arena_printf(a, "[%s]", gs) : "";
+    if (sig->ret && sig->ret->kind != TK_VOID)
+        return arena_printf(a, "%s %s%s(%s): %s", head, name, generic, ps, ty_show(a, sig->ret));
+    return arena_printf(a, "%s %s%s(%s)", head, name, generic, ps);
+}
+
+static module *cur_module(checker *C) { return C->l ? module_find(C->l, C->current_module) : NULL; }
+
+static bool word_char(char c) { return isalnum((unsigned char)c) || c == '_'; }
+
+// The first whole-word `word` in src[from, to).
+static bool word_in(const char *src, size_t len, uint32_t from, uint32_t to, const char *word, span *out) {
+    size_t n = strlen(word);
+    if (to > len) to = (uint32_t)len;
+    for (uint32_t i = from; i + n <= to; i++) {
+        if (memcmp(src + i, word, n) != 0) continue;
+        if (i > 0 && word_char(src[i - 1])) continue;
+        if (i + n < len && word_char(src[i + n])) continue;
+        *out = span_make(i, i + n);
+        return true;
+    }
+    return false;
+}
+
+// The name written last inside `at`, e.g. the member in `a.b.name`.
+static span tail_span(checker *C, span at, const char *name) {
+    module *m = cur_module(C);
+    size_t n = strlen(name);
+    if (m && at.end >= n && at.end <= m->src_len && memcmp(m->src + at.end - n, name, n) == 0)
+        return span_make(at.end - n, at.end);
+    span out = at;
+    if (m) {
+        uint32_t from = at.start;
+        span found;
+        while (word_in(m->src, m->src_len, from, at.end, name, &found)) { out = found; from = found.end; }
+    }
+    return out;
+}
+
+static void rec_add(checker *C, ref_kind kind, span use, const char *name, ty *t, const char *detail,
+                    const char *def_module, span def, bool has_def) {
+    if (!C->rec) return;
+    ref_info r;
+    r.kind = kind;
+    r.module = C->current_module;
+    r.use = use;
+    r.has_def = has_def;
+    r.def_module = def_module;
+    r.def = def;
+    r.name = name;
+    r.t = t;
+    r.detail = detail;
+    vec_push(C->a, &C->rec->refs, r);
+}
+
+static void rec_declaration(checker *C, ref_kind kind, const char *name, ty *t, span decl) {
+    const char *detail = arena_printf(C->a, "%s: %s", name, ty_show(C->a, t));
+    rec_add(C, kind, decl, name, t, detail, C->current_module, decl, true);
+}
+
+// Where the module-level declaration `q` ("module.name") is written.
+static bool locate_item(checker *C, const char *q, const char **def_module, span *def, item **found) {
+    if (!C->l) return false;
+    const char *dot = strchr(q, '.');
+    if (!dot) return false;
+    char mname[128];
+    size_t mn = (size_t)(dot - q);
+    if (mn >= sizeof mname) return false;
+    memcpy(mname, q, mn);
+    mname[mn] = 0;
+    const char *iname = dot + 1;
+    module *m = module_find(C->l, mname);
+    if (!m || !m->prog) return false;
+    for (int i = 0; i < m->prog->items.len; i++) {
+        item *it = &m->prog->items.at[i];
+        const char *nm = NULL;
+        span whole = span_make(0, 0);
+        span name_at;
+        bool have_name = false;
+        switch (it->kind) {
+            case IT_FUNC: case IT_EXTERN: nm = it->as.fn->name; name_at = it->as.fn->name_at; have_name = true; whole = it->as.fn->at; break;
+            case IT_STRUCT: nm = it->as.st->name; whole = it->as.st->at; break;
+            case IT_ENUM: nm = it->as.en->name; whole = it->as.en->at; break;
+            case IT_INTERFACE: nm = it->as.iface->name; whole = it->as.iface->at; break;
+            case IT_LET: nm = it->as.let->as.let_.name; whole = it->as.let->at; break;
+            default: break;
+        }
+        if (!nm || strcmp(nm, iname) != 0) continue;
+        if (!have_name && !word_in(m->src, m->src_len, whole.start, whole.end, nm, &name_at)) name_at = whole;
+        *def_module = m->name;
+        *def = name_at;
+        if (found) *found = it;
+        return true;
+    }
+    return false;
+}
+
+// Where member `member` of the struct, enum or interface `owner` is written.
+static bool locate_member(checker *C, const char *owner, const char *member, const char **def_module, span *def) {
+    item *it;
+    const char *dm;
+    span ignore;
+    if (!locate_item(C, owner, &dm, &ignore, &it)) return false;
+    module *m = module_find(C->l, dm);
+    if (!m) return false;
+    if (it->kind == IT_STRUCT) {
+        struct_decl *st = it->as.st;
+        for (int i = 0; i < st->fields.len; i++)
+            if (strcmp(st->fields.at[i].name, member) == 0) {
+                span w = st->fields.at[i].at, n;
+                if (!word_in(m->src, m->src_len, w.start, w.end, member, &n)) n = w;
+                *def_module = dm; *def = n;
+                return true;
+            }
+        for (int i = 0; i < st->methods.len; i++)
+            if (strcmp(st->methods.at[i]->name, member) == 0) { *def_module = dm; *def = st->methods.at[i]->name_at; return true; }
+    } else if (it->kind == IT_ENUM) {
+        enum_decl *en = it->as.en;
+        for (int i = 0; i < en->variants.len; i++)
+            if (strcmp(en->variants.at[i].name, member) == 0) {
+                span w = en->variants.at[i].at, n;
+                if (!word_in(m->src, m->src_len, w.start, w.end, member, &n)) n = w;
+                *def_module = dm; *def = n;
+                return true;
+            }
+    } else if (it->kind == IT_INTERFACE) {
+        interface_decl *d = it->as.iface;
+        for (int i = 0; i < d->methods.len; i++)
+            if (strcmp(d->methods.at[i]->name, member) == 0) { *def_module = dm; *def = d->methods.at[i]->name_at; return true; }
+    }
+    return false;
+}
+
+static void rec_item_use(checker *C, const char *q, ref_kind kind, span use, const char *name, ty *t, const char *detail) {
+    if (!C->rec) return;
+    const char *dm = NULL;
+    span def = span_make(0, 0);
+    bool has = locate_item(C, q, &dm, &def, NULL);
+    rec_add(C, kind, use, name, t, detail, dm, def, has);
+}
+
+static void rec_member_use(checker *C, const char *owner, ref_kind kind, span use, const char *name, ty *t, const char *detail) {
+    if (!C->rec) return;
+    const char *dm = NULL;
+    span def = span_make(0, 0);
+    bool has = locate_member(C, owner, name, &dm, &def);
+    rec_add(C, kind, use, name, t, detail, dm, def, has);
+}
+
+// Where segment `index` of the path written in `at` is.
+static span segment_span(checker *C, span at, const path *p, int index) {
+    module *m = cur_module(C);
+    span cur = at;
+    uint32_t from = at.start;
+    if (m) {
+        for (int k = 0; k <= index; k++) {
+            span found;
+            if (!word_in(m->src, m->src_len, from, at.end, p->seg[k], &found)) return at;
+            cur = found;
+            from = found.end;
+        }
+    }
+    return cur;
 }
 
 static ty *check_expr(checker *C, expr *e);
@@ -206,8 +440,12 @@ static ty *resolve_ty(checker *C, type *t) {
             if (find_type_param(C, n)) return ty_param(C->a, n);
 
             const char *q = qualify(C, n);
-            if (q && (map_has(&C->d->structs, q) || map_has(&C->d->enums, q)))
+            if (q && (map_has(&C->d->structs, q) || map_has(&C->d->enums, q))) {
+                if (C->rec)
+                    rec_item_use(C, q, REF_TYPE, t->at, n, ty_named(C->a, intern_z(C->in, q)),
+                                 arena_printf(C->a, "%s %s", map_has(&C->d->structs, q) ? "struct" : "enum", n));
                 return ty_named(C->a, intern_z(C->in, q));
+            }
 
             if (strchr(n, '.')) {
                 const char *dot = strchr(n, '.');
@@ -1003,9 +1241,16 @@ static void check_func(checker *C, func *f, const char *owner) {
     }
     C->ret_ty = sig->ret;
 
-    push_scope(C);
-    for (int i = 0; i < sig->params.len; i++)
-        declare(C, sig->params.at[i].name, sig->params.at[i].t, false);
+    push_scope_to(C, f->body->at.end);
+    for (int i = 0; i < sig->params.len; i++) {
+        span name_at = f->at;
+        module *cm = C->rec ? cur_module(C) : NULL;
+        if (cm && i < f->params.len) {
+            span w = f->params.at[i].at;
+            if (!word_in(cm->src, cm->src_len, w.start, w.end, sig->params.at[i].name, &name_at)) name_at = w;
+        }
+        declare_at(C, sig->params.at[i].name, sig->params.at[i].t, false, REF_PARAM, name_at, f->body->at.start);
+    }
     for (int i = 0; i < f->body->stmts.len; i++)
         check_stmt(C, f->body->stmts.at[i]);
     pop_scope(C);
@@ -1016,7 +1261,83 @@ static void check_func(checker *C, func *f, const char *owner) {
     C->type_params.len = saved_params;
 }
 
+// Every declaration is a reference to itself, so a tool asked about a name at
+// its declaration gets the same answer as at a use.
+static void rec_item_decls(checker *C, program *p) {
+    module *m = cur_module(C);
+    if (!C->rec || !m) return;
+    for (int i = 0; i < p->items.len; i++) {
+        item *it = &p->items.at[i];
+        switch (it->kind) {
+            case IT_FUNC: case IT_EXTERN: {
+                func *f = it->as.fn;
+                const char *q = qualify(C, f->name);
+                fn_sig *sig = q ? (fn_sig *)map_get(&C->d->funcs, q) : NULL;
+                if (sig) rec_add(C, REF_FUNC, f->name_at, f->name, sig_as_func_ty(C, sig),
+                                 sig_describe(C->a, f->name, sig), C->current_module, f->name_at, true);
+                break;
+            }
+            case IT_STRUCT: {
+                struct_decl *st = it->as.st;
+                span n;
+                if (!word_in(m->src, m->src_len, st->at.start, st->at.end, st->name, &n)) n = st->at;
+                const char *q = qualify(C, st->name);
+                ty *t = q ? ty_named(C->a, intern_z(C->in, q)) : ty_error();
+                rec_add(C, REF_TYPE, n, st->name, t, arena_printf(C->a, "struct %s", st->name), C->current_module, n, true);
+                struct_info *si = q ? (struct_info *)map_get(&C->d->structs, q) : NULL;
+                for (int k = 0; si && k < st->fields.len; k++) {
+                    span fn_;
+                    span w = st->fields.at[k].at;
+                    if (!word_in(m->src, m->src_len, w.start, w.end, st->fields.at[k].name, &fn_)) fn_ = w;
+                    ty *ft = k < si->fields.len ? si->fields.at[k].t : ty_error();
+                    rec_add(C, REF_FIELD, fn_, st->fields.at[k].name, ft,
+                            arena_printf(C->a, "%s: %s", st->fields.at[k].name, ty_show(C->a, ft)),
+                            C->current_module, fn_, true);
+                }
+                for (int k = 0; si && k < st->methods.len; k++) {
+                    fn_sig *sig = sig_lookup(&si->methods, st->methods.at[k]->name);
+                    if (!sig) continue;
+                    rec_add(C, REF_METHOD, st->methods.at[k]->name_at, st->methods.at[k]->name, sig_as_func_ty(C, sig),
+                            sig_describe(C->a, st->methods.at[k]->name, sig), C->current_module,
+                            st->methods.at[k]->name_at, true);
+                }
+                break;
+            }
+            case IT_ENUM: {
+                enum_decl *en = it->as.en;
+                span n;
+                if (!word_in(m->src, m->src_len, en->at.start, en->at.end, en->name, &n)) n = en->at;
+                const char *q = qualify(C, en->name);
+                ty *t = q ? ty_named(C->a, intern_z(C->in, q)) : ty_error();
+                rec_add(C, REF_TYPE, n, en->name, t, arena_printf(C->a, "enum %s", en->name), C->current_module, n, true);
+                for (int k = 0; k < en->variants.len; k++) {
+                    span vn, w = en->variants.at[k].at;
+                    if (!word_in(m->src, m->src_len, w.start, w.end, en->variants.at[k].name, &vn)) vn = w;
+                    rec_add(C, REF_VARIANT, vn, en->variants.at[k].name, t,
+                            arena_printf(C->a, "%s.%s", en->name, en->variants.at[k].name), C->current_module, vn, true);
+                }
+                break;
+            }
+            case IT_INTERFACE: {
+                interface_decl *d = it->as.iface;
+                span n;
+                if (!word_in(m->src, m->src_len, d->at.start, d->at.end, d->name, &n)) n = d->at;
+                rec_add(C, REF_TYPE, n, d->name, ty_error(), arena_printf(C->a, "interface %s", d->name),
+                        C->current_module, n, true);
+                for (int k = 0; k < d->methods.len; k++)
+                    rec_add(C, REF_METHOD, d->methods.at[k]->name_at, d->methods.at[k]->name, ty_error(),
+                            arena_printf(C->a, "func %s", d->methods.at[k]->name), C->current_module,
+                            d->methods.at[k]->name_at, true);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
 static void check_bodies(checker *C, program *p) {
+    rec_item_decls(C, p);
     for (int i = 0; i < p->items.len; i++) {
         item *it = &p->items.at[i];
         switch (it->kind) {
@@ -1143,6 +1464,12 @@ static void check_pattern(checker *C, pattern *pat, ty *sty,
             }
             if (!covered_has(covered, vname)) vec_push(C->a, covered, vname);
 
+            if (C->rec) {
+                ty *vt = ty_named(C->a, enq);
+                rec_member_use(C, enq, REF_VARIANT, tail_span(C, p->at, vname), vname, vt,
+                               arena_printf(C->a, "%s.%s", en, vname));
+            }
+
             binding_vec *bs = &pat->as.variant.bindings;
             if (bs->len && bs->len != vi->payload.len) {
                 cerr(C, pat->at,
@@ -1152,7 +1479,7 @@ static void check_pattern(checker *C, pattern *pat, ty *sty,
             }
             for (int i = 0; i < bs->len; i++) {
                 ty *t = i < vi->payload.len ? vi->payload.at[i].t : ty_error();
-                declare(C, bs->at[i].name, t, false);
+                declare_at(C, bs->at[i].name, t, false, REF_LOCAL, bs->at[i].at, pat->at.end);
             }
             return;
         }
@@ -1171,7 +1498,7 @@ static void check_switch(checker *C, stmt *s) {
 
     case_vec *cases = &s->as.switch_.cases;
     for (int i = 0; i < cases->len; i++) {
-        push_scope(C);
+        push_scope_to(C, cases->at[i].at.end);
         for (int k = 0; k < cases->at[i].patterns.len; k++)
             check_pattern(C, &cases->at[i].patterns.at[k], sty, enum_name, &covered);
         for (int k = 0; k < cases->at[i].body.len; k++)
@@ -1210,7 +1537,7 @@ static void check_switch(checker *C, stmt *s) {
 }
 
 static void check_block(checker *C, block *b) {
-    push_scope(C);
+    push_scope_to(C, b->at.end);
     for (int i = 0; i < b->stmts.len; i++) check_stmt(C, b->stmts.at[i]);
     pop_scope(C);
 }
@@ -1243,7 +1570,12 @@ static void check_stmt(checker *C, stmt *s) {
             } else {
                 final_ty = got;
             }
-            declare(C, s->as.let_.name, final_ty, s->as.let_.is_var);
+            {
+                span name_at = s->at;
+                module *cm = C->rec ? cur_module(C) : NULL;
+                if (cm) word_in(cm->src, cm->src_len, s->at.start, s->at.end, s->as.let_.name, &name_at);
+                declare_at(C, s->as.let_.name, final_ty, s->as.let_.is_var, REF_LOCAL, name_at, s->at.end);
+            }
             return;
         }
 
@@ -1314,8 +1646,13 @@ static void check_stmt(checker *C, stmt *s) {
                      arena_printf(C->a, "`%s` is not iterable", ty_show(C->a, it)));
                 elem = ty_error();
             }
-            push_scope(C);
-            declare(C, s->as.for_.var, elem, false);
+            push_scope_to(C, s->as.for_.body->at.end);
+            {
+                span name_at = s->at;
+                module *cm = C->rec ? cur_module(C) : NULL;
+                if (cm) word_in(cm->src, cm->src_len, s->at.start, s->at.end, s->as.for_.var, &name_at);
+                declare_at(C, s->as.for_.var, elem, false, REF_LOCAL, name_at, s->as.for_.body->at.start);
+            }
             for (int i = 0; i < s->as.for_.body->stmts.len; i++)
                 check_stmt(C, s->as.for_.body->stmts.at[i]);
             pop_scope(C);
@@ -1443,14 +1780,30 @@ static const char *static_path(arena *a, expr *e) {
 // ordinary field access.
 static ty *type_member(checker *C, const char *head, const char *name, span at, bool *found) {
     *found = true;
+    span use_name = C->rec ? tail_span(C, at, name) : at;
+    span use_head = at;
+    if (C->rec) {
+        module *cm = cur_module(C);
+        span w;
+        if (cm && word_in(cm->src, cm->src_len, at.start, at.end, head, &w)) use_head = w;
+    }
 
     // `math.something` where `math` is an imported module.
     if (is_visible_module(C, head)) {
         const char *q = arena_printf(C->a, "%s.%s", head, name);
         fn_sig *sig = (fn_sig *)map_get(&C->d->funcs, q);
-        if (sig) return sig_as_func_ty(C, sig);
+        if (sig) {
+            ty *ft = sig_as_func_ty(C, sig);
+            rec_add(C, REF_MODULE, use_head, head, NULL, C->rec ? arena_printf(C->a, "module %s", head) : NULL, head, span_make(0, 0), false);
+            rec_item_use(C, q, REF_FUNC, use_name, name, ft, C->rec ? sig_describe(C->a, name, sig) : NULL);
+            return ft;
+        }
         ty *t = (ty *)map_get(&C->d->consts, q);
-        if (t) return t;
+        if (t) {
+            rec_add(C, REF_MODULE, use_head, head, NULL, C->rec ? arena_printf(C->a, "module %s", head) : NULL, head, span_make(0, 0), false);
+            rec_item_use(C, q, REF_CONST, use_name, name, t, C->rec ? arena_printf(C->a, "%s: %s", name, ty_show(C->a, t)) : NULL);
+            return t;
+        }
         if (map_has(&C->d->structs, q) || map_has(&C->d->enums, q)) {
             // A bare type name is not a value; only `math.T.member` is.
             *found = false;
@@ -1472,11 +1825,20 @@ static ty *type_member(checker *C, const char *head, const char *name, span at, 
         for (int i = 0; i < ei->variants.len; i++) {
             variant_info *vi = &ei->variants.at[i];
             if (strcmp(vi->name, name) != 0) continue;
-            if (vi->payload.len == 0) return ty_named(C->a, intern_z(C->in, q));
-            ty_vec ps;
-            memset(&ps, 0, sizeof ps);
-            for (int k = 0; k < vi->payload.len; k++) vec_push(C->a, &ps, vi->payload.at[k].t);
-            return ty_func(C->a, ps, ty_named(C->a, intern_z(C->in, q)));
+            ty *result;
+            if (vi->payload.len == 0) {
+                result = ty_named(C->a, intern_z(C->in, q));
+            } else {
+                ty_vec ps;
+                memset(&ps, 0, sizeof ps);
+                for (int k = 0; k < vi->payload.len; k++) vec_push(C->a, &ps, vi->payload.at[k].t);
+                result = ty_func(C->a, ps, ty_named(C->a, intern_z(C->in, q)));
+            }
+            if (C->rec) {
+                rec_item_use(C, q, REF_TYPE, use_head, head, ty_named(C->a, intern_z(C->in, q)), arena_printf(C->a, "enum %s", head));
+                rec_member_use(C, q, REF_VARIANT, use_name, name, result, arena_printf(C->a, "%s.%s: %s", head, name, ty_show(C->a, result)));
+            }
+            return result;
         }
         const char *known = "";
         for (int i = 0; i < ei->variants.len; i++)
@@ -1496,7 +1858,12 @@ static ty *type_member(checker *C, const char *head, const char *name, span at, 
                           arena_printf(C->a, "`%s` is not a static method of `%s`", name, q));
                 return ty_error();
             }
-            return sig_as_func_ty(C, sig);
+            ty *mt = sig_as_func_ty(C, sig);
+            if (C->rec) {
+                rec_item_use(C, q, REF_TYPE, use_head, head, ty_named(C->a, intern_z(C->in, q)), arena_printf(C->a, "struct %s", head));
+                rec_member_use(C, q, REF_METHOD, use_name, name, mt, sig_describe(C->a, name, sig));
+            }
+            return mt;
         }
         cerr(C, at, arena_printf(C->a, "`%s` has no static method `%s`", q, name));
         return ty_error();
@@ -1509,21 +1876,39 @@ static ty *type_member(checker *C, const char *head, const char *name, span at, 
 static ty *check_path(checker *C, path *p, span at) {
     if (p->n == 1) {
         const char *n = p->seg[0];
+        span use = at;
+        if (C->head_use_set) { use = C->head_use; C->head_use_set = false; }
         binding_entry *b = lookup(C, n);
-        if (b) return b->t;
+        if (b) {
+            if (C->rec && b->has_decl)
+                rec_add(C, b->kind, use, n, b->t, arena_printf(C->a, "%s: %s", n, ty_show(C->a, b->t)),
+                        C->current_module, b->decl, true);
+            return b->t;
+        }
 
         // A module's own declaration wins over a global builtin of the same
         // name (e.g. strings.sl's own `indexOf` over the array builtin).
         const char *q = qualify(C, n);
         if (q) {
             ty *cst = (ty *)map_get(&C->d->consts, q);
-            if (cst) return cst;
+            if (cst) {
+                rec_item_use(C, q, REF_CONST, use, n, cst, C->rec ? arena_printf(C->a, "%s: %s", n, ty_show(C->a, cst)) : NULL);
+                return cst;
+            }
             fn_sig *sig = (fn_sig *)map_get(&C->d->funcs, q);
-            if (sig) return sig_as_func_ty(C, sig);
+            if (sig) {
+                ty *ft = sig_as_func_ty(C, sig);
+                rec_item_use(C, q, REF_FUNC, use, n, ft, C->rec ? sig_describe(C->a, n, sig) : NULL);
+                return ft;
+            }
         }
 
         ty *bi = builtin_sig(C, n);
-        if (bi) return bi;
+        if (bi) {
+            rec_add(C, REF_BUILTIN, use, n, bi, C->rec ? arena_printf(C->a, "builtin %s", n) : NULL,
+                    NULL, span_make(0, 0), false);
+            return bi;
+        }
 
         // Nothing by that name here, so try the prelude. A host declares its
         // externs once there and no script has to repeat them; a name defined
@@ -1531,9 +1916,16 @@ static ty *check_path(checker *C, path *p, span at) {
         const char *pq = prelude_name(C, n);
         if (pq) {
             ty *cst = (ty *)map_get(&C->d->consts, pq);
-            if (cst) return cst;
+            if (cst) {
+                rec_item_use(C, pq, REF_CONST, use, n, cst, C->rec ? arena_printf(C->a, "%s: %s", n, ty_show(C->a, cst)) : NULL);
+                return cst;
+            }
             fn_sig *sig = (fn_sig *)map_get(&C->d->funcs, pq);
-            if (sig) return sig_as_func_ty(C, sig);
+            if (sig) {
+                ty *ft = sig_as_func_ty(C, sig);
+                rec_item_use(C, pq, REF_FUNC, use, n, ft, C->rec ? sig_describe(C->a, n, sig) : NULL);
+                return ft;
+            }
         }
         cerr(C, at, arena_printf(C->a, "cannot find `%s` in this scope", n));
         return ty_error();
@@ -1578,12 +1970,20 @@ static ty *check_path(checker *C, path *p, span at) {
     one.seg = p->seg;
     one.n = 1;
     one.at = at;
+    if (C->rec) { C->head_use = segment_span(C, at, p, 0); C->head_use_set = true; }
     ty *cur = check_path(C, &one, at);
-    for (int i = 1; i < p->n; i++) cur = field_or_method_ty(C, cur, p->seg[i], at);
+    C->head_use_set = false;
+    for (int i = 1; i < p->n; i++) {
+        if (C->rec) { C->member_use = segment_span(C, at, p, i); C->member_use_set = true; }
+        cur = field_or_method_ty(C, cur, p->seg[i], at);
+        C->member_use_set = false;
+    }
     return cur;
 }
 
 static ty *field_or_method_ty(checker *C, ty *base, const char *name, span at) {
+    span use = at;
+    if (C->rec) use = C->member_use_set ? C->member_use : tail_span(C, at, name);
     switch (base->kind) {
         case TK_ERROR:
             return ty_error();
@@ -1592,9 +1992,19 @@ static ty *field_or_method_ty(checker *C, ty *base, const char *name, span at) {
             struct_info *si = (struct_info *)map_get(&C->d->structs, base->name);
             if (si) {
                 for (int i = 0; i < si->fields.len; i++)
-                    if (strcmp(si->fields.at[i].name, name) == 0) return si->fields.at[i].t;
+                    if (strcmp(si->fields.at[i].name, name) == 0) {
+                        ty *ft = si->fields.at[i].t;
+                        if (C->rec)
+                            rec_member_use(C, base->name, REF_FIELD, use, name, ft,
+                                           arena_printf(C->a, "%s: %s", name, ty_show(C->a, ft)));
+                        return ft;
+                    }
                 fn_sig *sig = sig_lookup(&si->methods, name);
-                if (sig) return sig_as_func_ty(C, sig);
+                if (sig) {
+                    ty *mt = sig_as_func_ty(C, sig);
+                    if (C->rec) rec_member_use(C, base->name, REF_METHOD, use, name, mt, sig_describe(C->a, name, sig));
+                    return mt;
+                }
 
                 const char *known = "";
                 int n = 0;
@@ -1632,7 +2042,11 @@ static ty *field_or_method_ty(checker *C, ty *base, const char *name, span at) {
                     if (!ii) ii = (interface_info *)map_get(&C->d->interfaces, tp->bounds.at[i]);
                     if (!ii) continue;
                     fn_sig *sig = sig_lookup(&ii->methods, name);
-                    if (sig) return sig_as_func_ty(C, sig);
+                    if (sig) {
+                        ty *mt = sig_as_func_ty(C, sig);
+                        if (C->rec) rec_member_use(C, q ? q : tp->bounds.at[i], REF_METHOD, use, name, mt, sig_describe(C->a, name, sig));
+                        return mt;
+                    }
                 }
             }
             if (!tp || tp->bounds.len == 0) {
@@ -1660,7 +2074,9 @@ static ty *field_or_method_ty(checker *C, ty *base, const char *name, span at) {
                 (base->kind == TK_ARRAY || base->kind == TK_MAP || base->kind == TK_STR)) {
                 ty_vec none;
                 memset(&none, 0, sizeof none);
-                return ty_func(C->a, none, ty_int());
+                ty *lt = ty_func(C->a, none, ty_int());
+                rec_add(C, REF_BUILTIN, use, name, lt, C->rec ? "builtin len(): int" : NULL, NULL, span_make(0, 0), false);
+                return lt;
             }
             cerr(C, at, arena_printf(C->a, "`%s` has no field or method `%s`",
                                      ty_show(C->a, base), name));
@@ -1700,6 +2116,24 @@ static ty *check_struct_lit(checker *C, expr *e) {
         }
         for (int i = 0; i < fields->len; i++) check_expr(C, fields->at[i].value);
         return ty_error();
+    }
+
+    if (C->rec) {
+        rec_item_use(C, name, REF_TYPE, p->at, written, ty_named(C->a, intern_z(C->in, name)),
+                     arena_printf(C->a, "struct %s", written));
+        module *cm = cur_module(C);
+        for (int i = 0; cm && i < fields->len; i++) {
+            // the field name sits just before its value
+            uint32_t vstart = fields->at[i].value->at.start;
+            uint32_t from = vstart > 96 ? vstart - 96 : 0;
+            span use = span_make(vstart, vstart), found;
+            uint32_t scan = from;
+            while (word_in(cm->src, cm->src_len, scan, vstart, fields->at[i].name, &found)) { use = found; scan = found.end; }
+            for (int k = 0; k < si->fields.len; k++)
+                if (strcmp(si->fields.at[k].name, fields->at[i].name) == 0)
+                    rec_member_use(C, name, REF_FIELD, use, fields->at[i].name, si->fields.at[k].t,
+                                   arena_printf(C->a, "%s: %s", fields->at[i].name, ty_show(C->a, si->fields.at[k].t)));
+        }
     }
 
     for (int i = 0; i < fields->len; i++) {
@@ -1747,6 +2181,8 @@ static ty *check_call(checker *C, expr *e) {
     // the one function exempt from the arity check.
     if (callee->kind == EX_PATH && callee->as.p.n == 1 &&
         strcmp(callee->as.p.seg[0], "print") == 0 && !lookup(C, "print")) {
+        rec_add(C, REF_BUILTIN, callee->at, "print", NULL, C->rec ? "builtin print(...)" : NULL,
+                NULL, span_make(0, 0), false);
         for (int i = 0; i < args->len; i++) check_expr(C, args->at[i]);
         return ty_void();
     }
@@ -1823,8 +2259,10 @@ static ty *check_call(checker *C, expr *e) {
              arena_printf(C->a, "this call takes %d argument(s) but %d were supplied",
                           cty->params.len, args->len));
     }
+    ty *first_arg = NULL;
     for (int i = 0; i < args->len; i++) {
         ty *got = check_expr(C, args->at[i]);
+        if (i == 0) first_arg = got;
         if (i < cty->params.len)
             got = adopt_empty_literal(args->at[i], got, cty->params.at[i]);
         if (i < cty->params.len && !ty_assignable(got, cty->params.at[i])) {
@@ -1832,6 +2270,13 @@ static ty *check_call(checker *C, expr *e) {
                  arena_printf(C->a, "expected `%s`, found `%s`",
                               ty_show(C->a, cty->params.at[i]), ty_show(C->a, got)));
         }
+    }
+    // The builtins `keys` and `values` are typed by their argument, so the
+    // result can be passed where `[str]` or `[T]` is expected.
+    if (callee->kind == EX_PATH && callee->as.p.n == 1 && args->len == 1 &&
+        first_arg && first_arg->kind == TK_MAP && !lookup(C, callee->as.p.seg[0])) {
+        if (strcmp(callee->as.p.seg[0], "keys") == 0) return ty_array(C->a, first_arg->key);
+        if (strcmp(callee->as.p.seg[0], "values") == 0) return ty_array(C->a, first_arg->val);
     }
     return cty->ret;
 }
@@ -2060,6 +2505,10 @@ static void enter_module(checker *C, module *m) {
 }
 
 decls *check_modules(arena *a, sl_interner *in, loaded *l, diag_vec *diags) {
+    return check_modules_recorded(a, in, l, diags, NULL);
+}
+
+decls *check_modules_recorded(arena *a, sl_interner *in, loaded *l, diag_vec *diags, check_record *rec) {
     decls *d = NEW(a, decls);
     map_init(&d->structs, a);
     map_init(&d->enums, a);
@@ -2077,6 +2526,8 @@ decls *check_modules(arena *a, sl_interner *in, loaded *l, diag_vec *diags) {
     C.ret_ty = ty_void();
     C.current_module = "";
     C.prelude = l->prelude;
+    C.l = l;
+    C.rec = rec;
     map_init(&C.struct_tmpls, a);
     map_init(&C.enum_tmpls, a);
     map_init(&C.iface_tmpls, a);
